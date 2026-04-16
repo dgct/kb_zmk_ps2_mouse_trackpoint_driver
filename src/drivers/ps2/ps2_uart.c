@@ -35,6 +35,12 @@ LOG_MODULE_REGISTER(ps2_uart);
 
 #define PS2_UART_DATA_QUEUE_SIZE 100
 
+// Size of the callback ring buffer.
+// PS/2 mouse sends 3-byte packets at ~80Hz (240 bytes/sec).
+// At ~14.4kHz baud, bytes arrive ~694us apart. A depth of 8 covers
+// ~2.5 full packets of slack between ISR and work queue servicing.
+#define PS2_UART_CALLBACK_QUEUE_SIZE 8
+
 // Custom queue for background PS/2 processing work at low priority
 // We purposefully want this to be a fairly low priority, because
 // this queue is used while we wait to start a write.
@@ -165,7 +171,8 @@ struct ps2_uart_data {
 
     // PS2 driver interface callback
     struct k_work callback_work;
-    uint8_t callback_byte;
+    struct k_msgq callback_msgq;
+    uint8_t callback_msgq_buffer[PS2_UART_CALLBACK_QUEUE_SIZE];
     ps2_callback_t callback_isr;
 #if IS_ENABLED(CONFIG_PS2_UART_ENABLE_PS2_RESEND_CALLBACK)
     ps2_resend_callback_t resend_callback_isr;
@@ -577,11 +584,17 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
     if (err != 0) {
         const char *err_str = ps2_uart_read_get_error_str(err);
 
-        // Framing errors
+        // ACK (0xfa) commonly triggers framing errors due to the baud rate
+        // mismatch between PS/2 (~14,925) and UART (14,400). This is benign.
         if (byte == 0xfa && err == UART_ERROR_FRAMING) {
             // Ignore, because it is not a real error and happens frequently
         } else {
             LOG_WRN("UART RX detected error for byte 0x%x: %s (%d)", byte, err_str, err);
+
+            // Drop the byte. Framing/parity errors mean the byte value is
+            // unreliable. Processing corrupted bytes causes packet alignment
+            // desync that the driver cannot recover from at runtime.
+            return;
         }
     }
 
@@ -609,10 +622,12 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
     // that can be read later with the read using `ps2_read`
     if (data->callback_isr != NULL && data->callback_enabled) {
 
-        // Call callback from a worker to make sure the callback
-        // doesn't block the interrupt.
-        // Will call ps2_uart_read_callback_work_handler
-        data->callback_byte = byte;
+        // Enqueue the byte into a ring buffer instead of a single variable
+        // to prevent data loss when the work queue can't service between
+        // consecutive UART interrupts (e.g. during BLE radio events).
+        if (k_msgq_put(&data->callback_msgq, &byte, K_NO_WAIT) != 0) {
+            LOG_WRN("Callback queue full, dropping byte 0x%x", byte);
+        }
         k_work_submit_to_queue(&ps2_uart_work_queue_cb, &data->callback_work);
     } else {
         ps2_uart_data_queue_add(dev, byte);
@@ -638,14 +653,17 @@ const char *ps2_uart_read_get_error_str(int err) {
 
 void ps2_uart_read_callback_work_handler(struct k_work *work) {
 
-    // struct k_work_delayable *work_delayable = (struct k_work_delayable *)item;
     struct ps2_uart_data *data = CONTAINER_OF(work,
                                               struct ps2_uart_data,
                                               callback_work);
-    // const struct device *dev = data->dev;
 
-    data->callback_isr(data->dev, data->callback_byte);
-    data->callback_byte = 0x0;
+    // Drain all queued bytes. Multiple bytes may have arrived between
+    // the ISR enqueue and work queue servicing. Processing them in a
+    // batch keeps packet bytes temporally close, reducing alignment drift.
+    uint8_t byte;
+    while (k_msgq_get(&data->callback_msgq, &byte, K_NO_WAIT) == 0) {
+        data->callback_isr(data->dev, byte);
+    }
 }
 
 /*
@@ -1190,6 +1208,7 @@ static int ps2_uart_disable_callback(const struct device *dev) {
     // Make sure there are no stale items in the data queue
     // from before the callback was disabled.
     ps2_uart_data_queue_empty(dev);
+    k_msgq_purge(&data->callback_msgq);
 
     data->callback_enabled = false;
 
@@ -1205,6 +1224,7 @@ static int ps2_uart_enable_callback(const struct device *dev) {
     // LOG_DBG("Enabled PS2 callback.");
 
     ps2_uart_data_queue_empty(dev);
+    k_msgq_purge(&data->callback_msgq);
 
     return 0;
 }
@@ -1232,7 +1252,7 @@ static int ps2_uart_init(const struct device *dev) {
     // the ps2 callback
     data->dev = dev;
 
-    data->callback_byte = 0x0;
+    // callback_msgq is properly initialized later via k_msgq_init.
     data->callback_isr = NULL;
     data->callback_enabled = false;
     data->cur_write_status = PS2_UART_WRITE_STATUS_INACTIVE;
@@ -1274,6 +1294,8 @@ static int ps2_uart_init(const struct device *dev) {
     }
 
     k_work_init(&data->callback_work, ps2_uart_read_callback_work_handler);
+    k_msgq_init(&data->callback_msgq, data->callback_msgq_buffer,
+                sizeof(uint8_t), PS2_UART_CALLBACK_QUEUE_SIZE);
 
     k_work_init_delayable(&data->write_scl_timout, ps2_uart_write_scl_timeout);
 
