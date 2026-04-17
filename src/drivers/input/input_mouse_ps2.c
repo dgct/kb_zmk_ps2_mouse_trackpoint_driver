@@ -833,13 +833,18 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
  * Idle Power Management
  *
  * After CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS of no trackpoint
- * packets, the driver sends PS/2 F5 (disable reporting), drains any
- * in-flight bytes, and suspends the UART peripheral (which also applies
- * the sleep pinctrl state to disconnect the RX input buffer).
+ * packets, the driver disables the PS/2 callback, drains in-flight
+ * bytes, and suspends the UART peripheral (which also applies the
+ * sleep pinctrl state to disconnect the RX input buffer).
  *
- * Wake is triggered by ZMK activity events (local keypress on the
- * peripheral half).  The UART is resumed, the PS/2 callback is
- * re-enabled, and F4 (enable reporting) is sent.
+ * Reporting is deliberately left enabled (no F5) so the trackpoint
+ * can still drive the data line low on motion, firing a GPIO
+ * falling-edge interrupt that wakes us (if wake-gpios is configured).
+ *
+ * Wake is triggered by the GPIO interrupt (trackpoint motion) or by
+ * ZMK activity events (local keypress).  The UART is resumed and the
+ * PS/2 callback is re-enabled (no F4 needed since reporting was
+ * never disabled).
  */
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
@@ -870,13 +875,14 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
 
     LOG_INF("TP idle PM: entering DORMANT");
 
-    /* 1. Stop TP from streaming packets (sends F5 + disables callback) */
-    err = zmk_mouse_ps2_activity_reporting_disable(dev);
+    /* 1. Disable the PS/2 callback so no packets are processed during
+     *    the transition.  Crucially, we do NOT send F5 (disable
+     *    reporting) — the TP must remain in reporting-enabled state so
+     *    it can transmit a start bit when the stick is moved, which is
+     *    what fires the GPIO wake interrupt. */
+    err = ps2_disable_callback(config->ps2_device);
     if (err) {
-        LOG_WRN("TP idle PM: failed to disable reporting (%d), retrying later", err);
-        k_work_reschedule(&data->idle_pm_dormant_work,
-                          K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
-        return;
+        LOG_WRN("TP idle PM: ps2_disable_callback failed (%d)", err);
     }
 
     /* 2. Drain any in-flight UART bytes */
@@ -939,10 +945,11 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         LOG_WRN("TP idle PM: UART resume failed (%d)", err);
     }
 
-    /* 3. Re-enable reporting (sends F4 + enables callback) */
-    err = zmk_mouse_ps2_activity_reporting_enable(dev);
+    /* 3. Re-enable the PS/2 callback (reporting was never disabled,
+     *    so no F4 is needed). */
+    err = ps2_enable_callback(config->ps2_device);
     if (err) {
-        LOG_ERR("TP idle PM: failed to re-enable reporting (%d)", err);
+        LOG_ERR("TP idle PM: ps2_enable_callback failed (%d)", err);
     }
 
     /* 4. Reset packet buffer to avoid misalignment from stale state */
