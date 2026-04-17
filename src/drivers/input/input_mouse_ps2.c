@@ -24,6 +24,10 @@
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/events/position_state_changed.h>
+
+/* Forward declaration — definition is near the end of this file */
+struct zmk_mouse_ps2_data;
+static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data);
 #endif
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
