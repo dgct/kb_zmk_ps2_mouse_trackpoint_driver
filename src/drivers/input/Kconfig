@@ -42,9 +42,13 @@ config ZMK_INPUT_MOUSE_PS2_IDLE_PM
     select PM_DEVICE
     default n
     help
-      After a configurable period of trackpoint inactivity, disable PS/2
-      data reporting (F5) and suspend the UART peripheral to save power.
-      Wake automatically on any local keypress via ZMK activity events.
+      After a configurable period of trackpoint inactivity, suspend the
+      UART peripheral to save power.  Reporting is left enabled (no F5)
+      so the trackpoint can still drive the data line on motion.
+      If wake-gpios is set in devicetree, the driver reclaims the UART
+      RX pin as a GPIO falling-edge interrupt while suspended, allowing
+      trackpoint motion itself to wake the driver.  Also wakes on any
+      local keypress via ZMK activity events.
 
 config ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS
     int "Milliseconds of TP inactivity before suspending"
