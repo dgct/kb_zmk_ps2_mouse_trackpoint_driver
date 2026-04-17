@@ -70,3 +70,15 @@ properties:
     type: int
     required: false
     description: The layer that should be toggled when the mouse is moved.
+
+  wake-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      GPIO connected to the PS/2 data line (same physical pin as the
+      UART RX). Used by CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM to
+      re-configure the pin as a falling-edge GPIO interrupt while the
+      UART is suspended, so that motion from the trackpoint itself can
+      wake the driver (in addition to local keypresses). Must be
+      ACTIVE_LOW (the PS/2 start bit pulls the line low).
+
