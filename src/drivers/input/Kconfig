@@ -37,4 +37,21 @@ config ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN
       Default minimum report interval in milliseconds.
       Slow down input reporting for hid queue over the air.
 
+config ZMK_INPUT_MOUSE_PS2_IDLE_PM
+    bool "Enable idle power management for PS/2 mouse"
+    select PM_DEVICE
+    default n
+    help
+      After a configurable period of trackpoint inactivity, disable PS/2
+      data reporting (F5) and suspend the UART peripheral to save power.
+      Wake automatically on any local keypress via ZMK activity events.
+
+config ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS
+    int "Milliseconds of TP inactivity before suspending"
+    depends on ZMK_INPUT_MOUSE_PS2_IDLE_PM
+    default 30000
+    help
+      How long the trackpoint must be idle (no packets) before the driver
+      enters dormant state. Default 30 seconds.
+
 endif # ZMK_INPUT_MOUSE_PS2

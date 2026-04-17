@@ -18,6 +18,14 @@
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+#include <zephyr/pm/device.h>
+#include <zmk/activity.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/activity_state_changed.h>
+#include <zmk/events/position_state_changed.h>
+#endif
+
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /*
@@ -222,6 +230,16 @@ struct zmk_mouse_ps2_data {
 
     void *activity_callback;
     void *activity_resend_callback;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+    enum {
+        TP_PM_ACTIVE,
+        TP_PM_DORMANT,
+    } pm_state;
+    struct k_work_delayable idle_pm_dormant_work;
+    struct k_work idle_pm_wake_work;
+    const struct device *uart_dev;
+#endif
 };
 
 // declare datas and configs for all devices
@@ -412,6 +430,10 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
     zmk_mouse_ps2_activity_click_buttons(data->dev, packet.button_l, packet.button_m, packet.button_r);
 
     data->prev_packet = packet;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+    tp_idle_pm_notify_activity(data);
+#endif
 }
 
 struct zmk_mouse_ps2_packet
@@ -796,6 +818,142 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
 
     return 0;
 }
+
+/*
+ * Idle Power Management
+ *
+ * After CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS of no trackpoint
+ * packets, the driver sends PS/2 F5 (disable reporting), drains any
+ * in-flight bytes, and suspends the UART peripheral (which also applies
+ * the sleep pinctrl state to disconnect the RX input buffer).
+ *
+ * Wake is triggered by ZMK activity events (local keypress on the
+ * peripheral half).  The UART is resumed, the PS/2 callback is
+ * re-enabled, and F4 (enable reporting) is sent.
+ */
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+
+static void tp_idle_pm_dormant_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = (struct k_work_delayable *)work;
+    struct zmk_mouse_ps2_data *data =
+        CONTAINER_OF(dwork, struct zmk_mouse_ps2_data, idle_pm_dormant_work);
+    const struct device *dev = data->dev;
+    int err;
+
+    if (data->pm_state == TP_PM_DORMANT) {
+        return;
+    }
+
+    LOG_INF("TP idle PM: entering DORMANT");
+
+    /* 1. Stop TP from streaming packets (sends F5 + disables callback) */
+    err = zmk_mouse_ps2_activity_reporting_disable(dev);
+    if (err) {
+        LOG_WRN("TP idle PM: failed to disable reporting (%d), retrying later", err);
+        k_work_reschedule(&data->idle_pm_dormant_work,
+                          K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+        return;
+    }
+
+    /* 2. Drain any in-flight UART bytes */
+    k_sleep(K_MSEC(5));
+
+    /* 3. Suspend the UART peripheral (applies sleep pinctrl automatically) */
+    err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_SUSPEND);
+    if (err && err != -EALREADY) {
+        LOG_WRN("TP idle PM: UART suspend failed (%d)", err);
+    }
+
+    data->pm_state = TP_PM_DORMANT;
+}
+
+static void tp_idle_pm_wake_handler(struct k_work *work) {
+    struct zmk_mouse_ps2_data *data =
+        CONTAINER_OF(work, struct zmk_mouse_ps2_data, idle_pm_wake_work);
+    const struct device *dev = data->dev;
+    int err;
+
+    if (data->pm_state != TP_PM_DORMANT) {
+        return;
+    }
+
+    LOG_INF("TP idle PM: waking to ACTIVE");
+
+    /* Cancel any pending dormant transition */
+    k_work_cancel_delayable(&data->idle_pm_dormant_work);
+
+    /* 1. Resume the UART peripheral (restores default pinctrl) */
+    err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_RESUME);
+    if (err && err != -EALREADY) {
+        LOG_WRN("TP idle PM: UART resume failed (%d)", err);
+    }
+
+    /* 2. Re-enable reporting (sends F4 + enables callback) */
+    err = zmk_mouse_ps2_activity_reporting_enable(dev);
+    if (err) {
+        LOG_ERR("TP idle PM: failed to re-enable reporting (%d)", err);
+    }
+
+    /* 3. Reset packet buffer to avoid misalignment from stale state */
+    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+
+    data->pm_state = TP_PM_ACTIVE;
+
+    /* Restart the idle timer */
+    k_work_reschedule(&data->idle_pm_dormant_work,
+                      K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+}
+
+static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data) {
+    /* Reschedule the idle timer — trackpoint is active */
+    k_work_reschedule(&data->idle_pm_dormant_work,
+                      K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+}
+
+/*
+ * ZMK event listeners for idle PM wake.
+ *
+ * We subscribe to both activity_state_changed and position_state_changed
+ * as belt-and-suspenders: the former fires when ZMK's activity subsystem
+ * detects input, the latter fires directly on local key events.  Both
+ * are confirmed to run on peripheral builds.
+ */
+
+static int tp_idle_pm_activity_listener(const zmk_event_t *eh) {
+    const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
+    if (ev == NULL || ev->state != ZMK_ACTIVITY_ACTIVE) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    /* Wake all driver instances */
+    #define TP_IDLE_PM_WAKE_N(n)                                              \
+        if (data##n.pm_state == TP_PM_DORMANT) {                              \
+            k_work_submit(&data##n.idle_pm_wake_work);                        \
+        }
+    DT_INST_FOREACH_STATUS_OKAY(TP_IDLE_PM_WAKE_N)
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(tp_idle_pm_activity, tp_idle_pm_activity_listener);
+ZMK_SUBSCRIPTION(tp_idle_pm_activity, zmk_activity_state_changed);
+
+static int tp_idle_pm_position_listener(const zmk_event_t *eh) {
+    /* Any key press/release — wake the TP if dormant */
+    #define TP_IDLE_PM_POS_WAKE_N(n)                                          \
+        if (data##n.pm_state == TP_PM_DORMANT) {                              \
+            k_work_submit(&data##n.idle_pm_wake_work);                        \
+        }
+    DT_INST_FOREACH_STATUS_OKAY(TP_IDLE_PM_POS_WAKE_N)
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(tp_idle_pm_position, tp_idle_pm_position_listener);
+ZMK_SUBSCRIPTION(tp_idle_pm_position, zmk_position_state_changed);
+
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM */
 
 /*
  * PS/2 Command Helpers
@@ -1819,6 +1977,26 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     }
 
     k_work_init_delayable(&data->packet_buffer_timeout, zmk_mouse_ps2_activity_packet_timout);
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+    /*
+     * The UART device sits one level above the PS/2 protocol device in
+     * the devicetree: uart0 → uart_ps2 → mouse_ps2.  We need the UART
+     * for PM suspend/resume.  DT_BUS(ps2_node) gives us uart0.
+     */
+    data->uart_dev = DEVICE_DT_GET(
+        DT_BUS(DT_PHANDLE(DT_DRV_INST(0), ps2_device)));
+
+    k_work_init_delayable(&data->idle_pm_dormant_work, tp_idle_pm_dormant_handler);
+    k_work_init(&data->idle_pm_wake_work, tp_idle_pm_wake_handler);
+    data->pm_state = TP_PM_ACTIVE;
+
+    /* Start the idle timer */
+    k_work_reschedule(&data->idle_pm_dormant_work,
+                      K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+    LOG_INF("TP idle PM: enabled (timeout %d ms)",
+            CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS);
+#endif
 
     return;
 }
