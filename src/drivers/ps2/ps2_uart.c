@@ -590,11 +590,6 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
             // Ignore, because it is not a real error and happens frequently
         } else {
             LOG_WRN("UART RX detected error for byte 0x%x: %s (%d)", byte, err_str, err);
-
-            // Drop the byte. Framing/parity errors mean the byte value is
-            // unreliable. Processing corrupted bytes causes packet alignment
-            // desync that the driver cannot recover from at runtime.
-            return;
         }
     }
 
