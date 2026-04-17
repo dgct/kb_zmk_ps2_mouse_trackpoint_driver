@@ -187,6 +187,11 @@ struct zmk_mouse_ps2_config {
     bool tp_x_invert;
     bool tp_y_invert;
     bool tp_xy_swap;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+    bool has_wake_gpio;
+    struct gpio_dt_spec wake_gpio;
+#endif
 };
 
 struct zmk_mouse_ps2_packet {
@@ -243,6 +248,7 @@ struct zmk_mouse_ps2_data {
     struct k_work_delayable idle_pm_dormant_work;
     struct k_work idle_pm_wake_work;
     const struct device *uart_dev;
+    struct gpio_callback wake_gpio_cb;
 #endif
 };
 
@@ -838,11 +844,24 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
 
+static void tp_idle_pm_wake_gpio_isr(const struct device *port,
+                                     struct gpio_callback *cb, uint32_t pins) {
+    struct zmk_mouse_ps2_data *data =
+        CONTAINER_OF(cb, struct zmk_mouse_ps2_data, wake_gpio_cb);
+
+    /* Just queue the wake; the handler disables the GPIO interrupt
+     * and resumes the UART in thread context (the nRF GPIO driver's
+     * interrupt reconfigure can grab a spinlock, which we'd rather
+     * not do from ISR). */
+    k_work_submit(&data->idle_pm_wake_work);
+}
+
 static void tp_idle_pm_dormant_handler(struct k_work *work) {
     struct k_work_delayable *dwork = (struct k_work_delayable *)work;
     struct zmk_mouse_ps2_data *data =
         CONTAINER_OF(dwork, struct zmk_mouse_ps2_data, idle_pm_dormant_work);
     const struct device *dev = data->dev;
+    const struct zmk_mouse_ps2_config *config = dev->config;
     int err;
 
     if (data->pm_state == TP_PM_DORMANT) {
@@ -869,6 +888,23 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
         LOG_WRN("TP idle PM: UART suspend failed (%d)", err);
     }
 
+    /* 4. Reclaim the data pin as a GPIO input with falling-edge interrupt.
+     * The TP pulls the line low on its next transmission (PS/2 start
+     * bit), which fires the ISR and wakes us.  This clears the
+     * INPUT_DISCONNECT applied by the UART sleep pinctrl. */
+    if (config->has_wake_gpio) {
+        err = gpio_pin_configure_dt(&config->wake_gpio, GPIO_INPUT);
+        if (err) {
+            LOG_WRN("TP idle PM: wake GPIO configure failed (%d)", err);
+        } else {
+            err = gpio_pin_interrupt_configure_dt(&config->wake_gpio,
+                                                  GPIO_INT_EDGE_TO_INACTIVE);
+            if (err) {
+                LOG_WRN("TP idle PM: wake GPIO interrupt failed (%d)", err);
+            }
+        }
+    }
+
     data->pm_state = TP_PM_DORMANT;
 }
 
@@ -876,6 +912,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     struct zmk_mouse_ps2_data *data =
         CONTAINER_OF(work, struct zmk_mouse_ps2_data, idle_pm_wake_work);
     const struct device *dev = data->dev;
+    const struct zmk_mouse_ps2_config *config = dev->config;
     int err;
 
     if (data->pm_state != TP_PM_DORMANT) {
@@ -887,19 +924,28 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* Cancel any pending dormant transition */
     k_work_cancel_delayable(&data->idle_pm_dormant_work);
 
-    /* 1. Resume the UART peripheral (restores default pinctrl) */
+    /* 1. Disable the wake GPIO interrupt (idempotent — ISR may have
+     * already done this) and release the pin so the UART pinctrl can
+     * reclaim it on resume. */
+    if (config->has_wake_gpio) {
+        gpio_pin_interrupt_configure_dt(&config->wake_gpio, GPIO_INT_DISABLE);
+        /* DISCONNECTED — hand the pin back to the pinctrl framework */
+        gpio_pin_configure_dt(&config->wake_gpio, GPIO_DISCONNECTED);
+    }
+
+    /* 2. Resume the UART peripheral (restores default pinctrl) */
     err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_RESUME);
     if (err && err != -EALREADY) {
         LOG_WRN("TP idle PM: UART resume failed (%d)", err);
     }
 
-    /* 2. Re-enable reporting (sends F4 + enables callback) */
+    /* 3. Re-enable reporting (sends F4 + enables callback) */
     err = zmk_mouse_ps2_activity_reporting_enable(dev);
     if (err) {
         LOG_ERR("TP idle PM: failed to re-enable reporting (%d)", err);
     }
 
-    /* 3. Reset packet buffer to avoid misalignment from stale state */
+    /* 4. Reset packet buffer to avoid misalignment from stale state */
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
     data->pm_state = TP_PM_ACTIVE;
@@ -1995,11 +2041,33 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     k_work_init(&data->idle_pm_wake_work, tp_idle_pm_wake_handler);
     data->pm_state = TP_PM_ACTIVE;
 
+    /* Wire up the wake GPIO callback (interrupt is armed lazily in
+     * the dormant handler, so the ISR doesn't fire during normal
+     * UART operation) */
+    if (config->has_wake_gpio) {
+        if (device_is_ready(config->wake_gpio.port)) {
+            gpio_init_callback(&data->wake_gpio_cb,
+                               tp_idle_pm_wake_gpio_isr,
+                               BIT(config->wake_gpio.pin));
+            err = gpio_add_callback(config->wake_gpio.port,
+                                    &data->wake_gpio_cb);
+            if (err) {
+                LOG_WRN("TP idle PM: gpio_add_callback failed (%d)", err);
+            } else {
+                LOG_INF("TP idle PM: wake GPIO armed on pin %d",
+                        config->wake_gpio.pin);
+            }
+        } else {
+            LOG_WRN("TP idle PM: wake GPIO port not ready");
+        }
+    }
+
     /* Start the idle timer */
     k_work_reschedule(&data->idle_pm_dormant_work,
                       K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
-    LOG_INF("TP idle PM: enabled (timeout %d ms)",
-            CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS);
+    LOG_INF("TP idle PM: enabled (timeout %d ms, wake-gpio=%s)",
+            CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS,
+            config->has_wake_gpio ? "yes" : "no");
 #endif
 
     return;
@@ -2177,6 +2245,13 @@ DT_INST_FOREACH_STATUS_OKAY(PS2_MOUSE_CALLBACK_DEFINE)
         .tp_x_invert = DT_INST_PROP_OR(n, tp_x_invert, false),                                \
         .tp_y_invert = DT_INST_PROP_OR(n, tp_y_invert, false),                                \
         .tp_xy_swap = DT_INST_PROP_OR(n, tp_xy_swap, false),                                  \
+        IF_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM, (                                      \
+        .has_wake_gpio = DT_INST_NODE_HAS_PROP(n, wake_gpios),                                \
+        .wake_gpio = COND_CODE_1(                                                             \
+            DT_INST_NODE_HAS_PROP(n, wake_gpios),                                             \
+            (GPIO_DT_SPEC_INST_GET(n, wake_gpios)),                                           \
+            ({ .port = NULL, .pin = 0, .dt_flags = 0, })),                                    \
+        ))                                                                                    \
     };                                                                                        \
     DEVICE_DT_INST_DEFINE(n, &zmk_mouse_ps2_init, NULL, &data##n, &config##n,                 \
                         POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);
