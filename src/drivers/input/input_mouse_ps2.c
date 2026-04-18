@@ -1846,6 +1846,61 @@ void zmk_mouse_ps2_tp_dump_registers(const struct device *dev) {
     LOG_INF("=== TrackPoint Register Dump END ===");
 }
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TP_REGISTER_PROBE)
+
+static int tp_write_register(const struct device *dev, uint8_t reg_addr, uint8_t value) {
+    /* E2 81 XX YY — write register, 0 byte response */
+    char cmd[5] = {0xE2, 0x81, (char)reg_addr, (char)value, 0x00};
+    struct zmk_mouse_ps2_send_cmd_resp resp =
+        zmk_mouse_ps2_send_cmd(dev, cmd, sizeof(cmd), NULL, 0, true);
+    return resp.err;
+}
+
+void zmk_mouse_ps2_tp_probe_register(const struct device *dev) {
+    uint8_t reg = CONFIG_ZMK_INPUT_MOUSE_PS2_TP_PROBE_REG;
+    uint8_t new_val = CONFIG_ZMK_INPUT_MOUSE_PS2_TP_PROBE_VAL;
+    uint8_t before = 0xFF, after = 0xFF;
+    int err;
+
+    LOG_INF("=== TrackPoint Register Probe: P1 0x%02X <- 0x%02X ===", reg, new_val);
+
+    err = tp_set_register_page(dev, 1);
+    if (err) {
+        LOG_ERR("Probe: could not switch to page 1: %d", err);
+        return;
+    }
+
+    err = tp_read_register(dev, reg, &before);
+    if (err) {
+        LOG_ERR("Probe: could not read P1 0x%02X (before): %d", reg, err);
+        goto restore;
+    }
+    LOG_INF("Probe: P1 0x%02X before = 0x%02X", reg, before);
+
+    err = tp_write_register(dev, reg, new_val);
+    if (err) {
+        LOG_ERR("Probe: write E2 81 %02X %02X failed: %d", reg, new_val, err);
+        goto restore;
+    }
+
+    err = tp_read_register(dev, reg, &after);
+    if (err) {
+        LOG_ERR("Probe: could not read P1 0x%02X (after): %d", reg, err);
+        goto restore;
+    }
+    LOG_INF("Probe: P1 0x%02X after  = 0x%02X (write %s)", reg, after,
+            (after == new_val) ? "ACCEPTED" : "REJECTED/CLAMPED");
+
+restore:
+    err = tp_set_register_page(dev, 0);
+    if (err) {
+        LOG_WRN("Probe: could not switch back to page 0: %d", err);
+    }
+    LOG_INF("=== TrackPoint Register Probe END ===");
+}
+
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_TP_REGISTER_PROBE */
+
 #endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_TP_REGISTER_DUMP */
 
 int zmk_mouse_ps2_settings_log_dev(const struct device *dev) {
@@ -2101,6 +2156,9 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TP_REGISTER_DUMP)
     if (data->is_trackpoint) {
         zmk_mouse_ps2_tp_dump_registers(dev);
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TP_REGISTER_PROBE)
+        zmk_mouse_ps2_tp_probe_register(dev);
+#endif
     }
 #endif
 

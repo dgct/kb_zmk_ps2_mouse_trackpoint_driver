@@ -67,4 +67,28 @@ config ZMK_INPUT_MOUSE_PS2_TP_REGISTER_DUMP
       via LOG_INF. Useful for reverse-engineering power management
       registers on Sprintek controllers. Requires USB logging enabled.
 
+config ZMK_INPUT_MOUSE_PS2_TP_REGISTER_PROBE
+    bool "Probe a Page 1 TrackPoint register by writing a test value at boot"
+    depends on ZMK_INPUT_MOUSE_PS2_TP_REGISTER_DUMP
+    default n
+    help
+      After dumping registers, write a test value to a Page 1 register
+      (volatile RAM only — NOT saved to NV, lost on next reset). Used
+      for reverse-engineering Sprintek power management. Reads the
+      value before and after to confirm the write took effect, then
+      lets the driver continue normally so you can measure the effect
+      (idle current, behavior, etc).
+
+config ZMK_INPUT_MOUSE_PS2_TP_PROBE_REG
+    hex "Page 1 register address to probe (0x00-0x3F)"
+    depends on ZMK_INPUT_MOUSE_PS2_TP_REGISTER_PROBE
+    default 0x06
+    range 0x00 0x3F
+
+config ZMK_INPUT_MOUSE_PS2_TP_PROBE_VAL
+    hex "Value to write to the probed register"
+    depends on ZMK_INPUT_MOUSE_PS2_TP_REGISTER_PROBE
+    default 0x0A
+    range 0x00 0xFF
+
 endif # ZMK_INPUT_MOUSE_PS2
