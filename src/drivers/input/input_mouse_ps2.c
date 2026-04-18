@@ -1879,43 +1879,46 @@ static int tp_parse_hex_byte(const char **pp) {
 }
 
 void zmk_mouse_ps2_tp_probe_register(const struct device *dev) {
-    /* Comma-separated list of "REG:VAL" probes from Kconfig string.
-     * Example: "05:14,11:03,18:00,19:00"
-     * Each probe writes VAL to P1 register REG and verifies via readback.
-     * All writes are volatile (RAM only) — lost on next reset. */
+    /* Comma-separated list of "PR:VAL" probes from Kconfig string.
+     * P is page (0 or 1), R is register (hex), VAL is hex byte.
+     * Example: "04A:32,105:14"  writes 0x32 to P0 0x4A and 0x14 to P1 0x05.
+     * Each probe writes VAL via E2 81 RR VV, with explicit page select before. */
     const char *list = CONFIG_ZMK_INPUT_MOUSE_PS2_TP_PROBE_LIST;
-    int err;
 
     LOG_INF("=== TrackPoint Register Probe START (list=\"%s\") ===", list);
 
-    err = tp_set_register_page(dev, 1);
-    if (err) {
-        LOG_ERR("Probe: could not switch to page 1: %d", err);
-        return;
-    }
-
     const char *p = list;
     while (*p) {
+        /* Parse one digit page (0/1) */
+        int page = -1;
+        if (*p == '0') page = 0;
+        else if (*p == '1') page = 1;
+        else { LOG_WRN("Probe: expected page 0/1 at \"%s\"", p); break; }
+        p++;
         int reg = tp_parse_hex_byte(&p);
         if (reg < 0 || *p != ':') {
             LOG_WRN("Probe: parse error at \"%s\"", p);
             break;
         }
-        p++; /* skip ':' */
+        p++;
         int val = tp_parse_hex_byte(&p);
         if (val < 0) {
-            LOG_WRN("Probe: missing value after reg 0x%02X", reg);
+            LOG_WRN("Probe: missing value after P%d 0x%02X", page, reg);
             break;
         }
-        if (reg > 0x3F) {
-            LOG_WRN("Probe: skipping out-of-range reg 0x%02X", reg);
+
+        /* Switch page just before each probe */
+        int err = tp_set_register_page(dev, (uint8_t)page);
+        if (err) {
+            LOG_WRN("Probe: page select to %d failed: %d", page, err);
         } else {
             uint8_t before = 0xFF, after = 0xFF;
             int rerr = tp_read_register(dev, (uint8_t)reg, &before);
             int werr = tp_write_register(dev, (uint8_t)reg, (uint8_t)val);
             int aerr = tp_read_register(dev, (uint8_t)reg, &after);
             if (rerr || werr || aerr) {
-                LOG_WRN("Probe: P1 0x%02X r/w/r err = %d/%d/%d", reg, rerr, werr, aerr);
+                LOG_WRN("Probe: P%d 0x%02X r/w/r err = %d/%d/%d",
+                        page, reg, rerr, werr, aerr);
             } else {
                 const char *status;
                 if (after == (uint8_t)val) {
@@ -1925,8 +1928,8 @@ void zmk_mouse_ps2_tp_probe_register(const struct device *dev) {
                 } else {
                     status = "CLAMPED";
                 }
-                LOG_INF("Probe: P1 0x%02X  before=0x%02X  wrote=0x%02X  after=0x%02X  [%s]",
-                        reg, before, (uint8_t)val, after, status);
+                LOG_INF("Probe: P%d 0x%02X  before=0x%02X  wrote=0x%02X  after=0x%02X  [%s]",
+                        page, reg, before, (uint8_t)val, after, status);
             }
         }
         if (*p == ',') p++;
@@ -1936,10 +1939,9 @@ void zmk_mouse_ps2_tp_probe_register(const struct device *dev) {
         }
     }
 
-    err = tp_set_register_page(dev, 0);
-    if (err) {
-        LOG_WRN("Probe: could not switch back to page 0: %d", err);
-    }
+    /* Always end on page 0 for normal operation */
+    int rerr = tp_set_register_page(dev, 0);
+    if (rerr) LOG_WRN("Probe: could not switch back to page 0: %d", rerr);
     LOG_INF("=== TrackPoint Register Probe END ===");
 }
 

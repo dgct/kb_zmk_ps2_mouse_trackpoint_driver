@@ -79,11 +79,13 @@ config ZMK_INPUT_MOUSE_PS2_TP_REGISTER_PROBE
       write was accepted, rejected, or clamped.
 
 config ZMK_INPUT_MOUSE_PS2_TP_PROBE_LIST
-    string "Comma-separated list of REG:VAL hex pairs to probe"
+    string "Comma-separated list of PREG:VAL hex pairs to probe"
     depends on ZMK_INPUT_MOUSE_PS2_TP_REGISTER_PROBE
-    default "05:14,07:05,11:03,18:00,19:00"
+    default "04A:32,15E:1A,105:14,111:03"
     help
-      Each token is HEX:HEX (no 0x prefix), e.g. "05:14,11:03" writes
-      0x14 to P1 0x05 and 0x03 to P1 0x11. Page 1 only, range 00-3F.
+      Each token is PRR:VV (no 0x prefix), where P is page 0 or 1,
+      RR is two-hex-digit register, VV is two-hex-digit value.
+      Example: "04A:32" writes 0x32 to Page 0 register 0x4A.
+      Use this to identify writeable registers via REJECTED/ACCEPTED.
 
 endif # ZMK_INPUT_MOUSE_PS2
