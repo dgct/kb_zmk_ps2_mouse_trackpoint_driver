@@ -58,4 +58,13 @@ config ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS
       How long the trackpoint must be idle (no packets) before the driver
       enters dormant state. Default 30 seconds.
 
+config ZMK_INPUT_MOUSE_PS2_TP_REGISTER_DUMP
+    bool "Dump all TrackPoint register pages at boot over USB serial"
+    default n
+    help
+      At startup, after the TrackPoint is detected, read and log the
+      full internal register map (Page 0: 0x00-0x7F, Page 1: 0x00-0x3F)
+      via LOG_INF. Useful for reverse-engineering power management
+      registers on Sprintek controllers. Requires USB logging enabled.
+
 endif # ZMK_INPUT_MOUSE_PS2

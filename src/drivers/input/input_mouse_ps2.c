@@ -1755,6 +1755,99 @@ int zmk_mouse_ps2_settings_reset() {
     return 0;
 }
 
+/*
+ * TrackPoint Register Dump
+ *
+ * Reads all internal registers from the TrackPoint controller and logs
+ * them over USB serial.  Useful for reverse-engineering Sprintek power
+ * management registers.
+ *
+ * SK7100/SK8702/SK8707 register layout:
+ *   Page 0: 0x00-0x7F  (operational registers)
+ *   Page 1: 0x00-0x3F  (configuration / non-volatile)
+ *
+ * Commands used:
+ *   E2 80 XX     — read register XX (current page)
+ *   E2 84 XX     — set register page to XX
+ *   E2 82 XX     — block read 6 bytes from XX..XX+5
+ */
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TP_REGISTER_DUMP)
+
+static int tp_read_register(const struct device *dev, uint8_t reg_addr, uint8_t *value) {
+    /* E2 80 XX — read register, 1 byte response */
+    char cmd[4] = {0xE2, 0x80, (char)reg_addr, 0x00};
+    struct zmk_mouse_ps2_send_cmd_resp resp =
+        zmk_mouse_ps2_send_cmd(dev, cmd, sizeof(cmd), NULL, 1, true);
+    if (resp.err) {
+        *value = 0xFF;
+        return resp.err;
+    }
+    *value = resp.resp_buffer[0];
+    return 0;
+}
+
+static int tp_set_register_page(const struct device *dev, uint8_t page) {
+    /* E2 84 XX — set register page, 0 byte response */
+    char cmd[4] = {0xE2, 0x84, (char)page, 0x00};
+    struct zmk_mouse_ps2_send_cmd_resp resp =
+        zmk_mouse_ps2_send_cmd(dev, cmd, sizeof(cmd), NULL, 0, true);
+    return resp.err;
+}
+
+static void tp_dump_register_range(const struct device *dev, int page,
+                                   uint8_t start, uint8_t end) {
+    uint8_t val;
+    int err;
+    /* Print 16 bytes per line in hex dump format */
+    for (uint8_t base = start; base <= end; base += 16) {
+        char line[80];
+        int pos = 0;
+        pos += snprintf(line + pos, sizeof(line) - pos, "P%d 0x%02X:", page, base);
+        for (uint8_t off = 0; off < 16 && (base + off) <= end; off++) {
+            err = tp_read_register(dev, base + off, &val);
+            if (err) {
+                pos += snprintf(line + pos, sizeof(line) - pos, " ??");
+            } else {
+                pos += snprintf(line + pos, sizeof(line) - pos, " %02X", val);
+            }
+        }
+        LOG_INF("%s", line);
+        /* Small delay to avoid overwhelming the PS/2 bus */
+        k_sleep(K_MSEC(10));
+    }
+}
+
+void zmk_mouse_ps2_tp_dump_registers(const struct device *dev) {
+    LOG_INF("=== TrackPoint Register Dump START ===");
+
+    /* Page 0: operational registers 0x00-0x7F */
+    LOG_INF("--- Page 0 (0x00-0x7F) ---");
+    tp_dump_register_range(dev, 0, 0x00, 0x7F);
+
+    /* Switch to Page 1 */
+    int err = tp_set_register_page(dev, 1);
+    if (err) {
+        LOG_ERR("Could not switch to register page 1: %d", err);
+        LOG_INF("=== TrackPoint Register Dump END (page 1 failed) ===");
+        return;
+    }
+
+    /* Page 1: configuration registers 0x00-0x3F */
+    LOG_INF("--- Page 1 (0x00-0x3F) ---");
+    tp_dump_register_range(dev, 1, 0x00, 0x3F);
+
+    /* Switch back to Page 0 */
+    err = tp_set_register_page(dev, 0);
+    if (err) {
+        LOG_WRN("Could not switch back to register page 0: %d", err);
+    }
+
+    LOG_INF("=== TrackPoint Register Dump END ===");
+}
+
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_TP_REGISTER_DUMP */
+
 int zmk_mouse_ps2_settings_log_dev(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
 
@@ -2004,6 +2097,12 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         LOG_INF("Enabling scroll mode.");
         zmk_mouse_ps2_set_packet_mode(dev, MOUSE_PS2_PACKET_MODE_SCROLL);
     }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TP_REGISTER_DUMP)
+    if (data->is_trackpoint) {
+        zmk_mouse_ps2_tp_dump_registers(dev);
+    }
+#endif
 
     zmk_mouse_ps2_settings_init(dev);
 
