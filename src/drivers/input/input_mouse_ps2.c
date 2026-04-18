@@ -1856,13 +1856,37 @@ static int tp_write_register(const struct device *dev, uint8_t reg_addr, uint8_t
     return resp.err;
 }
 
+/* Parse one hex byte (1-2 hex chars). Advances *pp past consumed chars.
+ * Returns -1 on no hex digits found, else 0..255. */
+static int tp_parse_hex_byte(const char **pp) {
+    const char *p = *pp;
+    int v = 0;
+    int digits = 0;
+    while (digits < 2) {
+        char c = *p;
+        int d;
+        if (c >= '0' && c <= '9')      d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else break;
+        v = (v << 4) | d;
+        p++;
+        digits++;
+    }
+    if (digits == 0) return -1;
+    *pp = p;
+    return v;
+}
+
 void zmk_mouse_ps2_tp_probe_register(const struct device *dev) {
-    uint8_t reg = CONFIG_ZMK_INPUT_MOUSE_PS2_TP_PROBE_REG;
-    uint8_t new_val = CONFIG_ZMK_INPUT_MOUSE_PS2_TP_PROBE_VAL;
-    uint8_t before = 0xFF, after = 0xFF;
+    /* Comma-separated list of "REG:VAL" probes from Kconfig string.
+     * Example: "05:14,11:03,18:00,19:00"
+     * Each probe writes VAL to P1 register REG and verifies via readback.
+     * All writes are volatile (RAM only) — lost on next reset. */
+    const char *list = CONFIG_ZMK_INPUT_MOUSE_PS2_TP_PROBE_LIST;
     int err;
 
-    LOG_INF("=== TrackPoint Register Probe: P1 0x%02X <- 0x%02X ===", reg, new_val);
+    LOG_INF("=== TrackPoint Register Probe START (list=\"%s\") ===", list);
 
     err = tp_set_register_page(dev, 1);
     if (err) {
@@ -1870,28 +1894,48 @@ void zmk_mouse_ps2_tp_probe_register(const struct device *dev) {
         return;
     }
 
-    err = tp_read_register(dev, reg, &before);
-    if (err) {
-        LOG_ERR("Probe: could not read P1 0x%02X (before): %d", reg, err);
-        goto restore;
+    const char *p = list;
+    while (*p) {
+        int reg = tp_parse_hex_byte(&p);
+        if (reg < 0 || *p != ':') {
+            LOG_WRN("Probe: parse error at \"%s\"", p);
+            break;
+        }
+        p++; /* skip ':' */
+        int val = tp_parse_hex_byte(&p);
+        if (val < 0) {
+            LOG_WRN("Probe: missing value after reg 0x%02X", reg);
+            break;
+        }
+        if (reg > 0x3F) {
+            LOG_WRN("Probe: skipping out-of-range reg 0x%02X", reg);
+        } else {
+            uint8_t before = 0xFF, after = 0xFF;
+            int rerr = tp_read_register(dev, (uint8_t)reg, &before);
+            int werr = tp_write_register(dev, (uint8_t)reg, (uint8_t)val);
+            int aerr = tp_read_register(dev, (uint8_t)reg, &after);
+            if (rerr || werr || aerr) {
+                LOG_WRN("Probe: P1 0x%02X r/w/r err = %d/%d/%d", reg, rerr, werr, aerr);
+            } else {
+                const char *status;
+                if (after == (uint8_t)val) {
+                    status = (before == after) ? "NO-CHANGE" : "ACCEPTED";
+                } else if (after == before) {
+                    status = "REJECTED";
+                } else {
+                    status = "CLAMPED";
+                }
+                LOG_INF("Probe: P1 0x%02X  before=0x%02X  wrote=0x%02X  after=0x%02X  [%s]",
+                        reg, before, (uint8_t)val, after, status);
+            }
+        }
+        if (*p == ',') p++;
+        else if (*p != '\0') {
+            LOG_WRN("Probe: unexpected char '%c' in list", *p);
+            break;
+        }
     }
-    LOG_INF("Probe: P1 0x%02X before = 0x%02X", reg, before);
 
-    err = tp_write_register(dev, reg, new_val);
-    if (err) {
-        LOG_ERR("Probe: write E2 81 %02X %02X failed: %d", reg, new_val, err);
-        goto restore;
-    }
-
-    err = tp_read_register(dev, reg, &after);
-    if (err) {
-        LOG_ERR("Probe: could not read P1 0x%02X (after): %d", reg, err);
-        goto restore;
-    }
-    LOG_INF("Probe: P1 0x%02X after  = 0x%02X (write %s)", reg, after,
-            (after == new_val) ? "ACCEPTED" : "REJECTED/CLAMPED");
-
-restore:
     err = tp_set_register_page(dev, 0);
     if (err) {
         LOG_WRN("Probe: could not switch back to page 0: %d", err);
