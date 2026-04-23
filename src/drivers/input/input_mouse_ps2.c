@@ -240,6 +240,13 @@ struct zmk_mouse_ps2_data {
     void *activity_callback;
     void *activity_resend_callback;
 
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN > 0
+    int64_t adx;
+    int64_t ady;
+    int64_t last_smp_time;
+    int64_t last_rpt_time;
+#endif
+
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
     enum {
         TP_PM_UNINITIALIZED = 0, /* zero-init sentinel: listeners check != DORMANT, safe */
@@ -306,6 +313,12 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
+
+    if (data->packet_idx >= sizeof(data->packet_buffer)) {
+        LOG_ERR("Packet index %d out of bounds, resetting", data->packet_idx);
+        zmk_mouse_ps2_activity_reset_packet_buffer(data->dev);
+        return;
+    }
 
     data->packet_buffer[data->packet_idx] = byte;
 
@@ -514,29 +527,27 @@ void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, 
 
 #if CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN > 0
 
-    static int64_t adx = 0;
-    static int64_t ady = 0;
-    static int64_t last_smp_time = 0;
-    static int64_t last_rpt_time = 0;
     int64_t now = k_uptime_get();
-    if (now - last_smp_time >= CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN) {
-        adx = ady = 0;
+    if (now - data->last_smp_time >= CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN) {
+        data->adx = data->ady = 0;
     }
-    last_smp_time = now;
-    adx += mov_x;
-    ady += mov_y;
-    if (now - last_rpt_time < CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN) {
+    data->last_smp_time = now;
+    data->adx += mov_x;
+    data->ady += mov_y;
+    if (now - data->last_rpt_time < CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN) {
         return;
     }
-    if (have_x || have_y) {
-        last_rpt_time = now;
-        if (have_x) {
-            ret = input_report_rel(data->dev, INPUT_REL_X, adx, !have_y, K_NO_WAIT);
+    bool report_x = (data->adx != 0);
+    bool report_y = (data->ady != 0);
+    if (report_x || report_y) {
+        data->last_rpt_time = now;
+        if (report_x) {
+            ret = input_report_rel(data->dev, INPUT_REL_X, data->adx, !report_y, K_NO_WAIT);
         }
-        if (have_y) {
-            ret = input_report_rel(data->dev, INPUT_REL_Y, ady, true, K_NO_WAIT);
+        if (report_y) {
+            ret = input_report_rel(data->dev, INPUT_REL_Y, data->ady, true, K_NO_WAIT);
         }
-        adx = ady = 0;
+        data->adx = data->ady = 0;
     }
 
 #else /* CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN > 0 */
