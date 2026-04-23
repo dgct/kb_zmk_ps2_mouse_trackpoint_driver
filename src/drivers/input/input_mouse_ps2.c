@@ -242,10 +242,12 @@ struct zmk_mouse_ps2_data {
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
     enum {
+        TP_PM_UNINITIALIZED = 0, /* zero-init sentinel: listeners check != DORMANT, safe */
         TP_PM_ACTIVE,
         TP_PM_DORMANT,
     } pm_state;
     struct k_work_delayable idle_pm_dormant_work;
+    struct k_work_delayable idle_pm_dormant_finish_work;
     struct k_work idle_pm_wake_work;
     const struct device *uart_dev;
     struct gpio_callback wake_gpio_cb;
@@ -861,6 +863,8 @@ static void tp_idle_pm_wake_gpio_isr(const struct device *port,
     k_work_submit(&data->idle_pm_wake_work);
 }
 
+static void tp_idle_pm_dormant_finish_handler(struct k_work *work);
+
 static void tp_idle_pm_dormant_handler(struct k_work *work) {
     struct k_work_delayable *dwork = (struct k_work_delayable *)work;
     struct zmk_mouse_ps2_data *data =
@@ -873,7 +877,7 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
         return;
     }
 
-    LOG_INF("TP idle PM: entering DORMANT");
+    LOG_INF("TP idle PM: entering DORMANT (phase 1: disable callback)");
 
     /* 1. Disable the PS/2 callback so no packets are processed during
      *    the transition.  Crucially, we do NOT send F5 (disable
@@ -885,8 +889,29 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
         LOG_WRN("TP idle PM: ps2_disable_callback failed (%d)", err);
     }
 
-    /* 2. Drain any in-flight UART bytes */
-    k_sleep(K_MSEC(5));
+    /* 2. Schedule phase 2 after 5ms to drain in-flight UART bytes.
+     *    This replaces the old k_sleep(5ms) that blocked the system
+     *    workqueue. The delayable work yields back to sysworkq, so
+     *    other work items (BLE, display) can run in the gap. */
+    k_work_schedule(&data->idle_pm_dormant_finish_work, K_MSEC(5));
+}
+
+static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = (struct k_work_delayable *)work;
+    struct zmk_mouse_ps2_data *data =
+        CONTAINER_OF(dwork, struct zmk_mouse_ps2_data, idle_pm_dormant_finish_work);
+    const struct device *dev = data->dev;
+    const struct zmk_mouse_ps2_config *config = dev->config;
+    int err;
+
+    /* A wake may have been requested during the 5ms drain window.
+     * If so, the wake handler sets pm_state != DORMANT (it remains
+     * ACTIVE or UNINITIALIZED), and we should abort. */
+    if (data->pm_state == TP_PM_DORMANT) {
+        return;
+    }
+
+    LOG_INF("TP idle PM: entering DORMANT (phase 2: suspend UART)");
 
     /* 3. Suspend the UART peripheral (applies sleep pinctrl automatically) */
     err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_SUSPEND);
@@ -927,8 +952,9 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
 
     LOG_INF("TP idle PM: waking to ACTIVE");
 
-    /* Cancel any pending dormant transition */
+    /* Cancel any pending dormant transition (both phases) */
     k_work_cancel_delayable(&data->idle_pm_dormant_work);
+    k_work_cancel_delayable(&data->idle_pm_dormant_finish_work);
 
     /* 1. Disable the wake GPIO interrupt (idempotent — ISR may have
      * already done this) and release the pin so the UART pinctrl can
@@ -939,10 +965,29 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         gpio_pin_configure_dt(&config->wake_gpio, GPIO_DISCONNECTED);
     }
 
-    /* 2. Resume the UART peripheral (restores default pinctrl) */
-    err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_RESUME);
+    /* 2. Resume the UART peripheral with retry (restores default pinctrl).
+     *    If resume fails after all attempts, stay in DORMANT to avoid an
+     *    unrecoverable broken-ACTIVE state (driver thinks it's alive but
+     *    UART is dead → no TP data → idle timer expires → dormant → wake
+     *    → fail again → infinite cycle). */
+    err = -EAGAIN;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_RESUME);
+        if (err == 0 || err == -EALREADY) {
+            break;
+        }
+        LOG_WRN("TP idle PM: UART resume attempt %d/3 failed (%d)", attempt + 1, err);
+        k_busy_wait(500); /* 500µs between retries — short enough to not block sysworkq */
+    }
     if (err && err != -EALREADY) {
-        LOG_WRN("TP idle PM: UART resume failed (%d)", err);
+        LOG_ERR("TP idle PM: UART resume failed after 3 attempts (%d), staying DORMANT", err);
+        /* Re-arm the wake GPIO so another motion can retry. */
+        if (config->has_wake_gpio) {
+            gpio_pin_configure_dt(&config->wake_gpio, GPIO_INPUT);
+            gpio_pin_interrupt_configure_dt(&config->wake_gpio,
+                                            GPIO_INT_EDGE_TO_INACTIVE);
+        }
+        return;
     }
 
     /* 3. Re-enable the PS/2 callback (reporting was never disabled,
@@ -963,7 +1008,20 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
 }
 
 static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data) {
-    /* Reschedule the idle timer — trackpoint is active */
+    /* Reschedule the idle timer — trackpoint is active.
+     * Also cancel any in-progress dormant phase 2 (finish work) so
+     * activity during the 5ms drain window aborts the transition.
+     * If phase 1 already disabled the PS/2 callback, re-enable it. */
+    if (k_work_cancel_delayable(&data->idle_pm_dormant_finish_work) != 0) {
+        /* Phase 2 was pending — phase 1 already disabled the callback.
+         * Re-enable it since we're aborting the dormant transition. */
+        const struct device *dev = data->dev;
+        const struct zmk_mouse_ps2_config *config = dev->config;
+        int err = ps2_enable_callback(config->ps2_device);
+        if (err) {
+            LOG_WRN("TP idle PM: ps2_enable_callback failed on abort (%d)", err);
+        }
+    }
     k_work_reschedule(&data->idle_pm_dormant_work,
                       K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
 }
@@ -2045,6 +2103,7 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         DT_BUS(DT_PHANDLE(DT_DRV_INST(0), ps2_device)));
 
     k_work_init_delayable(&data->idle_pm_dormant_work, tp_idle_pm_dormant_handler);
+    k_work_init_delayable(&data->idle_pm_dormant_finish_work, tp_idle_pm_dormant_finish_handler);
     k_work_init(&data->idle_pm_wake_work, tp_idle_pm_wake_handler);
     data->pm_state = TP_PM_ACTIVE;
 
