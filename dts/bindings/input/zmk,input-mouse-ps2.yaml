@@ -42,6 +42,30 @@ properties:
     type: int
     description: Adjusts how sensitive the press-to-select feature is. The range is 0 - 255 and the default is 8. You can also adjust this setting at runtime without recompiling using the &mms behavior. If this setting is enabled, then the runtime behavior won't be saved into the runtime settings.
 
+  tp-up-thresh:
+    type: int
+    description: Controls the force release threshold for generating a click on the Z-axis. Lower values make it easier to complete a click without fully releasing pressure. Range 0-255, default 255.
+
+  tp-z-time:
+    type: int
+    description: Controls how sharp/fast a press must be to register as a click (time window in ~10ms units). Higher values are more forgiving for slow presses. Range 0-255, default 38.
+
+  tp-jenks-curv:
+    type: int
+    description: Minimum curvature of the force profile for a double-click to register. Lower values make double-click easier. Range 0-255, default 135.
+
+  tp-drag-hysteresis:
+    type: int
+    description: How hard it is to start a drag while Z-axis is pressed. 255 effectively disables drag. Lower values enable click-and-drag via the trackpoint cap. Range 0-255, default 255.
+
+  tp-min-drag:
+    type: int
+    description: Minimum sustained force needed to keep a drag active. Only relevant if drag-hysteresis is lowered. Range 0-255, default 20.
+
+  tp-reach:
+    type: int
+    description: Backup range for Z-axis press detection. Controls the proximity zone before the force threshold engages. Range 0-255, default 10.
+
   tp-sensitivity:
     type: int
     description: Adjusts the sensitivity setting on trackpoint devices. The range is 0 - 255 and the default is 128. You can also adjust this setting at runtime without recompiling using the &mms behavior. If this setting is enabled, then the runtime behavior won't be saved into the runtime settings.
