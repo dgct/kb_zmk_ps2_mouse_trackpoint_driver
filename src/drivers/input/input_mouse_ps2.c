@@ -862,6 +862,16 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
 
+/* Forward declarations for TP setting functions used by wake handler */
+int zmk_mouse_ps2_tp_sensitivity_set(const struct device *dev, int sensitivity);
+int zmk_mouse_ps2_tp_neg_inertia_set(const struct device *dev, int neg_inertia);
+int zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(const struct device *dev, int value6);
+int zmk_mouse_ps2_tp_press_to_select_set(const struct device *dev, bool enabled);
+int zmk_mouse_ps2_tp_pts_threshold_set(const struct device *dev, int pts_threshold);
+int zmk_mouse_ps2_tp_invert_x_set(const struct device *dev, bool enabled);
+int zmk_mouse_ps2_tp_invert_y_set(const struct device *dev, bool enabled);
+int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
+
 static void tp_idle_pm_wake_gpio_isr(const struct device *port,
                                      struct gpio_callback *cb, uint32_t pins) {
     struct zmk_mouse_ps2_data *data =
@@ -1010,6 +1020,33 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
 
     /* 4. Reset packet buffer to avoid misalignment from stale state */
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+
+    /* 5. Re-apply TP settings — extended registers (0xE2) are volatile
+     *    RAM and may be lost if the TP internally reset during UART
+     *    suspend (ESD, watchdog, power glitch on pinctrl transition).
+     *    This is idempotent: if the TP retained its state, re-writing
+     *    the same values is harmless.  Cost: ~30ms of PS/2 traffic. */
+    if (data->is_trackpoint) {
+        zmk_mouse_ps2_tp_sensitivity_set(dev, data->tp_sensitivity);
+        zmk_mouse_ps2_tp_neg_inertia_set(dev, data->tp_neg_inertia);
+        zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, data->tp_value6);
+
+        if (config->tp_press_to_select) {
+            zmk_mouse_ps2_tp_press_to_select_set(dev, true);
+            zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold);
+        }
+        if (config->tp_x_invert) {
+            zmk_mouse_ps2_tp_invert_x_set(dev, true);
+        }
+        if (config->tp_y_invert) {
+            zmk_mouse_ps2_tp_invert_y_set(dev, true);
+        }
+        if (config->tp_xy_swap) {
+            zmk_mouse_ps2_tp_swap_xy_set(dev, true);
+        }
+
+        LOG_INF("TP idle PM: re-applied TP register settings");
+    }
 
     data->pm_state = TP_PM_ACTIVE;
 
