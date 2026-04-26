@@ -373,6 +373,22 @@ void zmk_mouse_ps2_activity_scroll(const struct device *dev, int8_t scroll_y);
 void zmk_mouse_ps2_activity_click_buttons(const struct device *dev, 
                                           bool button_l, bool button_m, bool button_r);
 void zmk_mouse_ps2_activity_reset_packet_buffer(const struct device *dev);
+
+int zmk_mouse_ps2_tp_sensitivity_set(const struct device *dev, int sensitivity);
+int zmk_mouse_ps2_tp_neg_inertia_set(const struct device *dev, int neg_inertia);
+int zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(const struct device *dev, int value6);
+int zmk_mouse_ps2_tp_press_to_select_set(const struct device *dev, bool enabled);
+int zmk_mouse_ps2_tp_pts_threshold_set(const struct device *dev, int pts_threshold);
+int zmk_mouse_ps2_tp_up_thresh_set(const struct device *dev, int up_thresh);
+int zmk_mouse_ps2_tp_z_time_set(const struct device *dev, int z_time);
+int zmk_mouse_ps2_tp_jenks_curv_set(const struct device *dev, int jenks_curv);
+int zmk_mouse_ps2_tp_drag_hysteresis_set(const struct device *dev, int drag_hysteresis);
+int zmk_mouse_ps2_tp_min_drag_set(const struct device *dev, int min_drag);
+int zmk_mouse_ps2_tp_reach_set(const struct device *dev, int reach);
+int zmk_mouse_ps2_tp_invert_x_set(const struct device *dev, bool enabled);
+int zmk_mouse_ps2_tp_invert_y_set(const struct device *dev, bool enabled);
+int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
+
 static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work);
 
 struct zmk_mouse_ps2_packet
@@ -1012,22 +1028,6 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
  */
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
-
-/* Forward declarations for TP setting functions used by wake handler */
-int zmk_mouse_ps2_tp_sensitivity_set(const struct device *dev, int sensitivity);
-int zmk_mouse_ps2_tp_neg_inertia_set(const struct device *dev, int neg_inertia);
-int zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(const struct device *dev, int value6);
-int zmk_mouse_ps2_tp_press_to_select_set(const struct device *dev, bool enabled);
-int zmk_mouse_ps2_tp_pts_threshold_set(const struct device *dev, int pts_threshold);
-int zmk_mouse_ps2_tp_up_thresh_set(const struct device *dev, int up_thresh);
-int zmk_mouse_ps2_tp_z_time_set(const struct device *dev, int z_time);
-int zmk_mouse_ps2_tp_jenks_curv_set(const struct device *dev, int jenks_curv);
-int zmk_mouse_ps2_tp_drag_hysteresis_set(const struct device *dev, int drag_hysteresis);
-int zmk_mouse_ps2_tp_min_drag_set(const struct device *dev, int min_drag);
-int zmk_mouse_ps2_tp_reach_set(const struct device *dev, int reach);
-int zmk_mouse_ps2_tp_invert_x_set(const struct device *dev, bool enabled);
-int zmk_mouse_ps2_tp_invert_y_set(const struct device *dev, bool enabled);
-int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
 
 static void tp_idle_pm_wake_gpio_isr(const struct device *port,
                                      struct gpio_callback *cb, uint32_t pins) {
