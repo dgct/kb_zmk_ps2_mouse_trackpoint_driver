@@ -310,6 +310,7 @@ struct zmk_mouse_ps2_data {
     uint8_t tp_reach;
 
     bool tp_self_reset_pending;  /* true after receiving 0xAA, awaiting 0x00 device ID */
+    int64_t tp_self_reset_time;   /* uptime_ms when tp_self_reset_pending was set */
     struct k_work tp_self_reset_work;
 
     void *activity_callback;
@@ -457,6 +458,12 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
         // and schedule a work item to re-apply settings.
         if (data->tp_self_reset_pending) {
             data->tp_self_reset_pending = false;
+            int64_t elapsed = k_uptime_get() - data->tp_self_reset_time;
+            if (elapsed > 1000) {
+                LOG_WRN("Stale self-reset flag (%lld ms old), ignoring.", elapsed);
+                zmk_mouse_ps2_activity_reset_packet_buffer(data->dev);
+                return;
+            }
             if (byte == 0x00) {
                 LOG_WRN("TP self-reset detected (0xAA 0x00). "
                         "Scheduling re-apply of all TP settings.");
@@ -473,6 +480,7 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
             LOG_WRN("TP sent 0xAA (BAT pass) — possible self-reset. "
                     "Waiting for device ID byte.");
             data->tp_self_reset_pending = true;
+            data->tp_self_reset_time = k_uptime_get();
             zmk_mouse_ps2_activity_reset_packet_buffer(data->dev);
             return;
         }
@@ -912,7 +920,7 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
         resp.err = zmk_mouse_ps2_activity_reporting_disable(dev);
         if (resp.err) {
             snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not disable data reporting (%d)",
-                     err);
+                     resp.err);
         }
     }
 
@@ -923,7 +931,7 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
             resp.err = ps2_write(ps2_device, cmd[i]);
             if (resp.err) {
                 snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not send cmd byte %d/%d (%d)",
-                         i + 1, cmd_bytes, err);
+                         i + 1, cmd_bytes, resp.err);
                 break;
             }
         }
@@ -933,7 +941,7 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
         LOG_DBG("Sending arg...");
         resp.err = ps2_write(ps2_device, *arg);
         if (resp.err) {
-            snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not send arg (%d)", err);
+            snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not send arg (%d)", resp.err);
         }
     }
 
@@ -943,7 +951,7 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
             resp.err = ps2_read(ps2_device, &resp.resp_buffer[i]);
             if (resp.err) {
                 snprintf(resp.err_msg, sizeof(resp.err_msg),
-                         "Could not read response cmd byte %d/%d (%d)", i + 1, resp_len, err);
+                         "Could not read response cmd byte %d/%d (%d)", i + 1, resp_len, resp.err);
                 break;
             }
         }
@@ -1186,7 +1194,11 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         LOG_ERR("TP idle PM: ps2_enable_callback failed (%d)", err);
     }
 
-    /* 4. Reset packet buffer to avoid misalignment from stale state */
+    /* 4. Reset packet buffer and self-reset flag to avoid misalignment
+     *    from stale state.  If the TP sent 0xAA just before suspend
+     *    and we never received the 0x00, the flag would stick and
+     *    cause the first real movement byte to be swallowed. */
+    data->tp_self_reset_pending = false;
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
     /* 5. Re-apply TP settings — extended registers (0xE2) are volatile
@@ -1333,7 +1345,7 @@ int zmk_mouse_ps2_set_sampling_rate(const struct device *dev, uint8_t sampling_r
     struct zmk_mouse_ps2_data *data = dev->data;
 
     int rate_idx = zmk_mouse_ps2_array_get_elem_index(sampling_rate, allowed_sampling_rates,
-                                                      sizeof(allowed_sampling_rates));
+                                                      ARRAY_SIZE(allowed_sampling_rates));
     if (rate_idx == -1) {
         LOG_ERR("Requested to set illegal sampling rate: %d", sampling_rate);
         return -1;
@@ -2713,6 +2725,13 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         return;
     }
 
+    // Initialise the packet-buffer timeout BEFORE enabling data
+    // reporting — as soon as activity_reporting_enable succeeds,
+    // bytes can arrive and the callback handler schedules this
+    // timeout.  If it's uninitialised, Zephyr dereferences a NULL
+    // work handler and faults.
+    k_work_init_delayable(&data->packet_buffer_timeout, zmk_mouse_ps2_activity_packet_timout);
+
     LOG_INF("Enabling data reporting and ps2 callback...");
     err = zmk_mouse_ps2_activity_reporting_enable(dev);
     if (err) {
@@ -2720,8 +2739,6 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     } else {
         LOG_DBG("Successfully activated ps2 callback");
     }
-
-    k_work_init_delayable(&data->packet_buffer_timeout, zmk_mouse_ps2_activity_packet_timout);
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
     /*
