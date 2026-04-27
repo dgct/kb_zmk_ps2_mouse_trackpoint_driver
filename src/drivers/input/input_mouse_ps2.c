@@ -389,6 +389,40 @@ int zmk_mouse_ps2_tp_invert_x_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_invert_y_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
 
+/*
+ * Apply all TP register settings from data-> to hardware.
+ * Used by: init, self-reset recovery, idle PM wake.
+ * Each _set() validates, sends the PS/2 command, and updates data-> on success.
+ */
+static void zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
+    struct zmk_mouse_ps2_data *data = dev->data;
+    const struct zmk_mouse_ps2_config *config = dev->config;
+
+    zmk_mouse_ps2_tp_sensitivity_set(dev, data->tp_sensitivity);
+    zmk_mouse_ps2_tp_neg_inertia_set(dev, data->tp_neg_inertia);
+    zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, data->tp_value6);
+    zmk_mouse_ps2_tp_up_thresh_set(dev, data->tp_up_thresh);
+    zmk_mouse_ps2_tp_z_time_set(dev, data->tp_z_time);
+    zmk_mouse_ps2_tp_jenks_curv_set(dev, data->tp_jenks_curv);
+    zmk_mouse_ps2_tp_drag_hysteresis_set(dev, data->tp_drag_hysteresis);
+    zmk_mouse_ps2_tp_min_drag_set(dev, data->tp_min_drag);
+    zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach);
+
+    if (config->tp_press_to_select) {
+        zmk_mouse_ps2_tp_press_to_select_set(dev, true);
+        zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold);
+    }
+    if (config->tp_x_invert) {
+        zmk_mouse_ps2_tp_invert_x_set(dev, true);
+    }
+    if (config->tp_y_invert) {
+        zmk_mouse_ps2_tp_invert_y_set(dev, true);
+    }
+    if (config->tp_xy_swap) {
+        zmk_mouse_ps2_tp_swap_xy_set(dev, true);
+    }
+}
+
 static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work);
 
 struct zmk_mouse_ps2_packet
@@ -540,7 +574,6 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
     struct zmk_mouse_ps2_data *data = CONTAINER_OF(work, struct zmk_mouse_ps2_data,
                                                    tp_self_reset_work);
     const struct device *dev = data->dev;
-    const struct zmk_mouse_ps2_config *config = dev->config;
 
     LOG_WRN("TP self-reset recovery: re-applying all TP register settings");
 
@@ -548,29 +581,7 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
         return;
     }
 
-    zmk_mouse_ps2_tp_sensitivity_set(dev, data->tp_sensitivity);
-    zmk_mouse_ps2_tp_neg_inertia_set(dev, data->tp_neg_inertia);
-    zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, data->tp_value6);
-    zmk_mouse_ps2_tp_up_thresh_set(dev, data->tp_up_thresh);
-    zmk_mouse_ps2_tp_z_time_set(dev, data->tp_z_time);
-    zmk_mouse_ps2_tp_jenks_curv_set(dev, data->tp_jenks_curv);
-    zmk_mouse_ps2_tp_drag_hysteresis_set(dev, data->tp_drag_hysteresis);
-    zmk_mouse_ps2_tp_min_drag_set(dev, data->tp_min_drag);
-    zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach);
-
-    if (config->tp_press_to_select) {
-        zmk_mouse_ps2_tp_press_to_select_set(dev, true);
-        zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold);
-    }
-    if (config->tp_x_invert) {
-        zmk_mouse_ps2_tp_invert_x_set(dev, true);
-    }
-    if (config->tp_y_invert) {
-        zmk_mouse_ps2_tp_invert_y_set(dev, true);
-    }
-    if (config->tp_xy_swap) {
-        zmk_mouse_ps2_tp_swap_xy_set(dev, true);
-    }
+    zmk_mouse_ps2_tp_apply_all_settings(dev);
 
     LOG_WRN("TP self-reset recovery: all settings re-applied");
 }
@@ -1184,30 +1195,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    This is idempotent: if the TP retained its state, re-writing
      *    the same values is harmless.  Cost: ~30ms of PS/2 traffic. */
     if (data->is_trackpoint) {
-        zmk_mouse_ps2_tp_sensitivity_set(dev, data->tp_sensitivity);
-        zmk_mouse_ps2_tp_neg_inertia_set(dev, data->tp_neg_inertia);
-        zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, data->tp_value6);
-        zmk_mouse_ps2_tp_up_thresh_set(dev, data->tp_up_thresh);
-        zmk_mouse_ps2_tp_z_time_set(dev, data->tp_z_time);
-        zmk_mouse_ps2_tp_jenks_curv_set(dev, data->tp_jenks_curv);
-        zmk_mouse_ps2_tp_drag_hysteresis_set(dev, data->tp_drag_hysteresis);
-        zmk_mouse_ps2_tp_min_drag_set(dev, data->tp_min_drag);
-        zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach);
-
-        if (config->tp_press_to_select) {
-            zmk_mouse_ps2_tp_press_to_select_set(dev, true);
-            zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold);
-        }
-        if (config->tp_x_invert) {
-            zmk_mouse_ps2_tp_invert_x_set(dev, true);
-        }
-        if (config->tp_y_invert) {
-            zmk_mouse_ps2_tp_invert_y_set(dev, true);
-        }
-        if (config->tp_xy_swap) {
-            zmk_mouse_ps2_tp_swap_xy_set(dev, true);
-        }
-
+        zmk_mouse_ps2_tp_apply_all_settings(dev);
         LOG_INF("TP idle PM: re-applied TP register settings");
     }
 
@@ -2361,6 +2349,7 @@ int zmk_mouse_ps2_settings_save(const struct device *dev) {
 }
 
 int zmk_mouse_ps2_settings_reset_dev(const struct device *dev) {
+    struct zmk_mouse_ps2_data *data = dev->data;
 
     LOG_INF("Deleting runtime settings...");
     zmk_mouse_ps2_settings_reset_setting(MOUSE_PS2_ST_TP_SENSITIVITY);
@@ -2375,27 +2364,18 @@ int zmk_mouse_ps2_settings_reset_dev(const struct device *dev) {
     zmk_mouse_ps2_settings_reset_setting(MOUSE_PS2_ST_TP_REACH);
 
     LOG_INF("Restoring default settings to TP..");
-    zmk_mouse_ps2_tp_sensitivity_set(dev, MOUSE_PS2_CMD_TP_SET_SENSITIVITY_DEFAULT);
+    data->tp_sensitivity = MOUSE_PS2_CMD_TP_SET_SENSITIVITY_DEFAULT;
+    data->tp_neg_inertia = MOUSE_PS2_CMD_TP_SET_NEG_INERTIA_DEFAULT;
+    data->tp_value6 = MOUSE_PS2_CMD_TP_SET_VALUE6_UPPER_PLATEAU_SPEED_DEFAULT;
+    data->tp_pts_threshold = MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_DEFAULT;
+    data->tp_up_thresh = MOUSE_PS2_CMD_TP_SET_UP_THRESH_DEFAULT;
+    data->tp_z_time = MOUSE_PS2_CMD_TP_SET_Z_TIME_DEFAULT;
+    data->tp_jenks_curv = MOUSE_PS2_CMD_TP_SET_JENKS_CURV_DEFAULT;
+    data->tp_drag_hysteresis = MOUSE_PS2_CMD_TP_SET_DRAG_HYSTERESIS_DEFAULT;
+    data->tp_min_drag = MOUSE_PS2_CMD_TP_SET_MIN_DRAG_DEFAULT;
+    data->tp_reach = MOUSE_PS2_CMD_TP_SET_REACH_DEFAULT;
 
-    zmk_mouse_ps2_tp_neg_inertia_set(dev, MOUSE_PS2_CMD_TP_SET_NEG_INERTIA_DEFAULT);
-
-    zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(
-        dev,
-        MOUSE_PS2_CMD_TP_SET_VALUE6_UPPER_PLATEAU_SPEED_DEFAULT);
-
-    zmk_mouse_ps2_tp_pts_threshold_set(dev, MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_DEFAULT);
-
-    zmk_mouse_ps2_tp_up_thresh_set(dev, MOUSE_PS2_CMD_TP_SET_UP_THRESH_DEFAULT);
-
-    zmk_mouse_ps2_tp_z_time_set(dev, MOUSE_PS2_CMD_TP_SET_Z_TIME_DEFAULT);
-
-    zmk_mouse_ps2_tp_jenks_curv_set(dev, MOUSE_PS2_CMD_TP_SET_JENKS_CURV_DEFAULT);
-
-    zmk_mouse_ps2_tp_drag_hysteresis_set(dev, MOUSE_PS2_CMD_TP_SET_DRAG_HYSTERESIS_DEFAULT);
-
-    zmk_mouse_ps2_tp_min_drag_set(dev, MOUSE_PS2_CMD_TP_SET_MIN_DRAG_DEFAULT);
-
-    zmk_mouse_ps2_tp_reach_set(dev, MOUSE_PS2_CMD_TP_SET_REACH_DEFAULT);
+    zmk_mouse_ps2_tp_apply_all_settings(dev);
 
     return 0;
 }
@@ -2673,76 +2653,39 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
 
     if (data->is_trackpoint == true) {
 
-        if (config->tp_press_to_select) {
-            LOG_INF("Enabling TP press to select...");
-            zmk_mouse_ps2_tp_press_to_select_set(dev, true);
-        }
-
-        if (config->tp_press_to_select_threshold != -1) {
-            LOG_INF("Setting TP press to select thereshold to %d...",
-                    config->tp_press_to_select_threshold);
-            zmk_mouse_ps2_tp_pts_threshold_set(dev, config->tp_press_to_select_threshold);
-        }
-
+        // Copy devicetree overrides into data struct (sentinel -1 = not set)
         if (config->tp_sensitivity != -1) {
-            LOG_INF("Setting TP sensitivity to %d...", config->tp_sensitivity);
-            zmk_mouse_ps2_tp_sensitivity_set(dev, config->tp_sensitivity);
+            data->tp_sensitivity = config->tp_sensitivity;
         }
-
         if (config->tp_neg_inertia != -1) {
-            LOG_INF("Setting TP inertia to %d...", config->tp_neg_inertia);
-            zmk_mouse_ps2_tp_neg_inertia_set(dev, config->tp_neg_inertia);
+            data->tp_neg_inertia = config->tp_neg_inertia;
         }
-
         if (config->tp_val6_upper_speed != -1) {
-            LOG_INF("Setting TP value 6 upper speed plateau to %d...", config->tp_val6_upper_speed);
-            zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, config->tp_val6_upper_speed);
+            data->tp_value6 = config->tp_val6_upper_speed;
         }
-
+        if (config->tp_press_to_select_threshold != -1) {
+            data->tp_pts_threshold = config->tp_press_to_select_threshold;
+        }
         if (config->tp_up_thresh != -1) {
-            LOG_INF("Setting TP up threshold to %d...", config->tp_up_thresh);
-            zmk_mouse_ps2_tp_up_thresh_set(dev, config->tp_up_thresh);
+            data->tp_up_thresh = config->tp_up_thresh;
         }
-
         if (config->tp_z_time != -1) {
-            LOG_INF("Setting TP z-time to %d...", config->tp_z_time);
-            zmk_mouse_ps2_tp_z_time_set(dev, config->tp_z_time);
+            data->tp_z_time = config->tp_z_time;
         }
-
         if (config->tp_jenks_curv != -1) {
-            LOG_INF("Setting TP jenks curvature to %d...", config->tp_jenks_curv);
-            zmk_mouse_ps2_tp_jenks_curv_set(dev, config->tp_jenks_curv);
+            data->tp_jenks_curv = config->tp_jenks_curv;
         }
-
         if (config->tp_drag_hysteresis != -1) {
-            LOG_INF("Setting TP drag hysteresis to %d...", config->tp_drag_hysteresis);
-            zmk_mouse_ps2_tp_drag_hysteresis_set(dev, config->tp_drag_hysteresis);
+            data->tp_drag_hysteresis = config->tp_drag_hysteresis;
         }
-
         if (config->tp_min_drag != -1) {
-            LOG_INF("Setting TP minimum drag to %d...", config->tp_min_drag);
-            zmk_mouse_ps2_tp_min_drag_set(dev, config->tp_min_drag);
+            data->tp_min_drag = config->tp_min_drag;
         }
-
         if (config->tp_reach != -1) {
-            LOG_INF("Setting TP reach to %d...", config->tp_reach);
-            zmk_mouse_ps2_tp_reach_set(dev, config->tp_reach);
+            data->tp_reach = config->tp_reach;
         }
 
-        if (config->tp_x_invert) {
-            LOG_INF("Inverting trackpoint x axis.");
-            zmk_mouse_ps2_tp_invert_x_set(dev, true);
-        }
-
-        if (config->tp_y_invert) {
-            LOG_INF("Inverting trackpoint y axis.");
-            zmk_mouse_ps2_tp_invert_y_set(dev, true);
-        }
-
-        if (config->tp_xy_swap) {
-            LOG_INF("Swapping trackpoint x and y axis.");
-            zmk_mouse_ps2_tp_swap_xy_set(dev, true);
-        }
+        zmk_mouse_ps2_tp_apply_all_settings(dev);
     }
 
     if (config->scroll_mode) {
