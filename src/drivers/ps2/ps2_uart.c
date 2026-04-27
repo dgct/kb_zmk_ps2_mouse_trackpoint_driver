@@ -1130,6 +1130,14 @@ void ps2_uart_write_finish(const struct device *dev, bool successful, char *desc
     struct ps2_uart_data *data = dev->data;
     int err;
 
+    /* Disable SCL interrupt FIRST, before any state changes.  This
+     * prevents a stale ACK GPIO ISR from racing with a timeout-triggered
+     * write_finish: the timeout (work queue) enters here and disables
+     * the interrupt, so even if a delayed ACK edge was pending it cannot
+     * fire and cause a second write_finish / double k_sem_give.
+     * Idempotent with the later set_mode_read() disable. */
+    ps2_uart_set_scl_callback_enabled(dev, false);
+
     k_work_cancel_delayable(&data->write_scl_timout);
 
     if (successful) {
