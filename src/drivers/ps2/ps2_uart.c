@@ -1121,7 +1121,10 @@ void ps2_uart_write_finish(const struct device *dev, bool successful, char *desc
     err = ps2_uart_set_mode_read(dev);
     if (err != 0) {
         LOG_ERR("Could not configure driver for read mode: %d", err);
-        return;
+        // Fall through — MUST still give write_lock and unlock the
+        // mutex, otherwise all future writes deadlock and RX stays
+        // dead (TP dies permanently). The next write cycle's
+        // set_mode_write() will handle the stale RX state.
     }
 
     LOG_DBG("END WRITE: 0x%x\n", data->cur_write_byte);
