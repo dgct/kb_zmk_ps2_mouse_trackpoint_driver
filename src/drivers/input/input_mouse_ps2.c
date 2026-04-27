@@ -313,6 +313,10 @@ struct zmk_mouse_ps2_data {
     int64_t tp_self_reset_time;   /* uptime_ms when tp_self_reset_pending was set */
     struct k_work tp_self_reset_work;
 
+    int64_t last_byte_time;       /* uptime_ms of most recent PS/2 byte from TP */
+    int liveness_retries;         /* consecutive watchdog recovery attempts */
+    struct k_work_delayable liveness_watchdog;
+
     void *activity_callback;
     void *activity_resend_callback;
 
@@ -440,6 +444,7 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
 }
 
 static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work);
+static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work);
 
 struct zmk_mouse_ps2_packet
 zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode,
@@ -451,6 +456,10 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
 void zmk_mouse_ps2_activity_callback(const struct device *dev,
                                      const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = dev->data;
+
+    data->last_byte_time = k_uptime_get();
+    data->liveness_retries = 0;
+    k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
 
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
@@ -474,7 +483,7 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
         if (data->tp_self_reset_pending) {
             data->tp_self_reset_pending = false;
             int64_t elapsed = k_uptime_get() - data->tp_self_reset_time;
-            if (elapsed > 1000) {
+            if (elapsed > 50) {
                 LOG_WRN("Stale self-reset flag (%lld ms old), ignoring.", elapsed);
                 zmk_mouse_ps2_activity_reset_packet_buffer(data->dev);
                 return;
@@ -614,17 +623,68 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
      * reporting-disabled, but data->activity_reporting_on may still be
      * true (never cleared).  Clear it first so that
      * activity_reporting_enable() doesn't early-return, then send F4
-     * and re-enable the PS/2 callback. */
+     * and re-enable the PS/2 callback.
+     * Retry with backoff — a single failed 0xF4 write would leave the
+     * TP permanently dead. */
     data->activity_reporting_on = false;
-    int err = zmk_mouse_ps2_activity_reporting_enable(dev);
+    int err;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        err = zmk_mouse_ps2_activity_reporting_enable(dev);
+        if (err == 0) {
+            break;
+        }
+        LOG_WRN("TP self-reset recovery: reporting re-enable attempt %d failed: %d",
+                attempt + 1, err);
+        k_sleep(K_MSEC(100 * (attempt + 1)));
+    }
     if (err) {
-        LOG_ERR("TP self-reset recovery: failed to re-enable reporting (%d)", err);
+        LOG_ERR("TP self-reset recovery: all reporting re-enable attempts failed (%d)", err);
     }
 
     if (failures > 0) {
         LOG_WRN("TP self-reset recovery: completed with %d setting failure(s)", failures);
     } else {
         LOG_WRN("TP self-reset recovery: all settings re-applied");
+    }
+}
+
+/*
+ * TP Liveness Watchdog
+ *
+ * One-shot watchdog rescheduled on every incoming byte.  If no bytes
+ * arrive for 5 seconds while reporting is supposed to be on, something
+ * silently killed the TP.  Force-resend F4 and re-enable the callback.
+ * Gives up after 2 consecutive attempts to avoid hammering a truly
+ * dead device.
+ */
+static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = (struct k_work_delayable *)work;
+    struct zmk_mouse_ps2_data *data = CONTAINER_OF(dwork, struct zmk_mouse_ps2_data,
+                                                   liveness_watchdog);
+    const struct device *dev = data->dev;
+
+    if (!data->activity_reporting_on) {
+        return;
+    }
+
+    int64_t silence = k_uptime_get() - data->last_byte_time;
+    if (silence < 5000) {
+        /* A byte arrived between scheduling and firing; reschedule. */
+        k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
+        return;
+    }
+
+    LOG_WRN("TP liveness: no data for %lld ms, forcing reporting re-enable", silence);
+    data->activity_reporting_on = false;
+    int err = zmk_mouse_ps2_activity_reporting_enable(dev);
+    if (err) {
+        LOG_ERR("TP liveness: failed to re-enable reporting (%d)", err);
+    }
+
+    if (data->liveness_retries++ < 2) {
+        k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
+    } else {
+        LOG_ERR("TP liveness: giving up after %d attempts", data->liveness_retries);
     }
 }
 
@@ -2638,6 +2698,7 @@ int zmk_mouse_ps2_settings_init(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
 
     k_work_init(&data->tp_self_reset_work, zmk_mouse_ps2_tp_self_reset_work_handler);
+    k_work_init_delayable(&data->liveness_watchdog, zmk_mouse_ps2_liveness_watchdog_handler);
 
 #if IS_ENABLED(CONFIG_SETTINGS)
     LOG_DBG("");
@@ -2797,6 +2858,8 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         LOG_ERR("Could not activate ps2 callback: %d", err);
     } else {
         LOG_DBG("Successfully activated ps2 callback");
+        data->last_byte_time = k_uptime_get();
+        k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
     }
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
