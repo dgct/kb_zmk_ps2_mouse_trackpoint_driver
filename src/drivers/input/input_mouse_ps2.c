@@ -1176,6 +1176,11 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
 
     LOG_INF("TP idle PM: entering DORMANT (phase 1: disable callback)");
 
+    /* Cancel the liveness watchdog — UART will be suspended and no bytes
+     * will arrive.  Without this, the watchdog fires on a dead bus and
+     * exhausts its retries before the wake handler can restart it. */
+    k_work_cancel_delayable(&data->liveness_watchdog);
+
     /* 1. Disable the PS/2 callback so no packets are processed during
      *    the transition.  Crucially, we do NOT send F5 (disable
      *    reporting) — the TP must remain in reporting-enabled state so
@@ -1325,6 +1330,11 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     }
 
     data->pm_state = TP_PM_ACTIVE;
+
+    /* Restart the liveness watchdog now that the UART is live again. */
+    data->last_byte_time = k_uptime_get();
+    data->liveness_retries = 0;
+    k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
 
     /* Restart the idle timer */
     k_work_reschedule(&data->idle_pm_dormant_work,
