@@ -1354,6 +1354,11 @@ static int ps2_uart_init_uart(const struct device *dev) {
         return -EINVAL;
     }
 
+#if CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG
+    NRF_UARTE0->BAUDRATE = CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG;
+    LOG_INF("Overrode UARTE BAUDRATE register to 0x%08x", CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG);
+#endif
+
     uart_irq_callback_user_data_set(config->uart_dev, ps2_uart_interrupt_handler,
                                     (void *)data->dev);
 
