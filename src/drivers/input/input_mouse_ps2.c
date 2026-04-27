@@ -359,7 +359,8 @@ int zmk_mouse_ps2_settings_save();
  */
 
 #define MOUSE_PS2_GET_BIT(data, bit_pos) ((data >> bit_pos) & 0x1)
-#define MOUSE_PS2_SET_BIT(data, bit_val, bit_pos) (data |= (bit_val) << bit_pos)
+#define MOUSE_PS2_SET_BIT(data, bit_val, bit_pos) \
+	(data = (data & ~(1u << (bit_pos))) | (((bit_val) ? 1u : 0u) << (bit_pos)))
 
 /*
  * Mouse Activity Packet Reading
@@ -395,33 +396,47 @@ int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
  * Used by: init, self-reset recovery, idle PM wake.
  * Each _set() validates, sends the PS/2 command, and updates data-> on success.
  */
-static void zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
+static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
     const struct zmk_mouse_ps2_config *config = dev->config;
+    int failures = 0;
+    int total = 0;
 
-    zmk_mouse_ps2_tp_sensitivity_set(dev, data->tp_sensitivity);
-    zmk_mouse_ps2_tp_neg_inertia_set(dev, data->tp_neg_inertia);
-    zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, data->tp_value6);
-    zmk_mouse_ps2_tp_up_thresh_set(dev, data->tp_up_thresh);
-    zmk_mouse_ps2_tp_z_time_set(dev, data->tp_z_time);
-    zmk_mouse_ps2_tp_jenks_curv_set(dev, data->tp_jenks_curv);
-    zmk_mouse_ps2_tp_drag_hysteresis_set(dev, data->tp_drag_hysteresis);
-    zmk_mouse_ps2_tp_min_drag_set(dev, data->tp_min_drag);
-    zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach);
+#define APPLY_SETTING(call) do { total++; if ((call) != 0) { failures++; } } while (0)
+
+    APPLY_SETTING(zmk_mouse_ps2_tp_sensitivity_set(dev, data->tp_sensitivity));
+    APPLY_SETTING(zmk_mouse_ps2_tp_neg_inertia_set(dev, data->tp_neg_inertia));
+    APPLY_SETTING(zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, data->tp_value6));
+    APPLY_SETTING(zmk_mouse_ps2_tp_up_thresh_set(dev, data->tp_up_thresh));
+    APPLY_SETTING(zmk_mouse_ps2_tp_z_time_set(dev, data->tp_z_time));
+    APPLY_SETTING(zmk_mouse_ps2_tp_jenks_curv_set(dev, data->tp_jenks_curv));
+    APPLY_SETTING(zmk_mouse_ps2_tp_drag_hysteresis_set(dev, data->tp_drag_hysteresis));
+    APPLY_SETTING(zmk_mouse_ps2_tp_min_drag_set(dev, data->tp_min_drag));
+    APPLY_SETTING(zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach));
 
     if (config->tp_press_to_select) {
-        zmk_mouse_ps2_tp_press_to_select_set(dev, true);
-        zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold);
+        APPLY_SETTING(zmk_mouse_ps2_tp_press_to_select_set(dev, true));
+        APPLY_SETTING(zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold));
     }
     if (config->tp_x_invert) {
-        zmk_mouse_ps2_tp_invert_x_set(dev, true);
+        APPLY_SETTING(zmk_mouse_ps2_tp_invert_x_set(dev, true));
     }
     if (config->tp_y_invert) {
-        zmk_mouse_ps2_tp_invert_y_set(dev, true);
+        APPLY_SETTING(zmk_mouse_ps2_tp_invert_y_set(dev, true));
     }
     if (config->tp_xy_swap) {
-        zmk_mouse_ps2_tp_swap_xy_set(dev, true);
+        APPLY_SETTING(zmk_mouse_ps2_tp_swap_xy_set(dev, true));
     }
+
+#undef APPLY_SETTING
+
+    if (failures > 0) {
+        LOG_ERR("TP settings: %d/%d failed to apply", failures, total);
+    } else {
+        LOG_INF("TP settings: all %d applied successfully", total);
+    }
+
+    return failures;
 }
 
 static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work);
@@ -589,9 +604,28 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
         return;
     }
 
-    zmk_mouse_ps2_tp_apply_all_settings(dev);
+    /* Reset packet buffer — the self-reset 0xAA 0x00 sequence may have
+     * left the buffer in a partial state. */
+    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
-    LOG_WRN("TP self-reset recovery: all settings re-applied");
+    int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
+
+    /* Force-enable reporting.  After a self-reset the TP reverts to
+     * reporting-disabled, but data->activity_reporting_on may still be
+     * true (never cleared).  Clear it first so that
+     * activity_reporting_enable() doesn't early-return, then send F4
+     * and re-enable the PS/2 callback. */
+    data->activity_reporting_on = false;
+    int err = zmk_mouse_ps2_activity_reporting_enable(dev);
+    if (err) {
+        LOG_ERR("TP self-reset recovery: failed to re-enable reporting (%d)", err);
+    }
+
+    if (failures > 0) {
+        LOG_WRN("TP self-reset recovery: completed with %d setting failure(s)", failures);
+    } else {
+        LOG_WRN("TP self-reset recovery: all settings re-applied");
+    }
 }
 
 void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
@@ -932,6 +966,12 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
             if (resp.err) {
                 snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not send cmd byte %d/%d (%d)",
                          i + 1, cmd_bytes, resp.err);
+                if (i > 0 && cmd[0] == '\xe2') {
+                    LOG_WRN("Partial 0xE2 extended command: %d/%d bytes sent. "
+                            "TP command parser state is uncertain until next "
+                            "successful command or self-reset.",
+                            i, cmd_bytes);
+                }
                 break;
             }
         }
@@ -1207,8 +1247,21 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    This is idempotent: if the TP retained its state, re-writing
      *    the same values is harmless.  Cost: ~30ms of PS/2 traffic. */
     if (data->is_trackpoint) {
-        zmk_mouse_ps2_tp_apply_all_settings(dev);
-        LOG_INF("TP idle PM: re-applied TP register settings");
+        int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
+        if (failures > 0) {
+            LOG_WRN("TP idle PM: %d setting(s) failed to re-apply", failures);
+        } else {
+            LOG_INF("TP idle PM: re-applied TP register settings");
+        }
+
+        /* Safety net: if the TP self-reset during suspend, it reverts
+         * to reporting-disabled.  Force-send F4 to ensure reporting is
+         * on regardless of the cached flag state. */
+        data->activity_reporting_on = false;
+        err = zmk_mouse_ps2_activity_reporting_enable(dev);
+        if (err) {
+            LOG_ERR("TP idle PM: failed to re-enable reporting (%d)", err);
+        }
     }
 
     data->pm_state = TP_PM_ACTIVE;
@@ -2387,7 +2440,10 @@ int zmk_mouse_ps2_settings_reset_dev(const struct device *dev) {
     data->tp_min_drag = MOUSE_PS2_CMD_TP_SET_MIN_DRAG_DEFAULT;
     data->tp_reach = MOUSE_PS2_CMD_TP_SET_REACH_DEFAULT;
 
-    zmk_mouse_ps2_tp_apply_all_settings(dev);
+    int tp_failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
+    if (tp_failures > 0) {
+        LOG_WRN("Settings reset: %d TP setting(s) failed to apply", tp_failures);
+    }
 
     return 0;
 }
@@ -2648,7 +2704,7 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     if (config->sampling_rate != MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT) {
 
         LOG_INF("Setting sample rate to %d...", config->sampling_rate);
-        zmk_mouse_ps2_set_sampling_rate(dev, config->sampling_rate);
+        err = zmk_mouse_ps2_set_sampling_rate(dev, config->sampling_rate);
         if (err) {
             LOG_ERR("Could not set sampling rate to %d: %d", config->sampling_rate, err);
             return;
@@ -2697,7 +2753,10 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
             data->tp_reach = config->tp_reach;
         }
 
-        zmk_mouse_ps2_tp_apply_all_settings(dev);
+        int tp_failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
+        if (tp_failures > 0) {
+            LOG_WRN("Init: %d TP setting(s) failed to apply", tp_failures);
+        }
     }
 
     if (config->scroll_mode) {
