@@ -37,9 +37,11 @@ LOG_MODULE_REGISTER(ps2_uart);
 
 // Size of the callback ring buffer.
 // PS/2 mouse sends 3-byte packets at ~80Hz (240 bytes/sec).
-// At ~14.4kHz baud, bytes arrive ~694us apart. A depth of 8 covers
-// ~2.5 full packets of slack between ISR and work queue servicing.
-#define PS2_UART_CALLBACK_QUEUE_SIZE 8
+// At ~14.4kHz baud, bytes arrive ~694us apart. A depth of 16 covers
+// ~5 full packets of slack between ISR and work queue servicing,
+// providing margin during BLE radio events that can preempt the
+// work queue for >5ms.
+#define PS2_UART_CALLBACK_QUEUE_SIZE 16
 
 // Custom queue for background PS/2 processing work at low priority
 // We purposefully want this to be a fairly low priority, because
@@ -819,12 +821,20 @@ int ps2_uart_write_byte_await_response(const struct device *dev, uint8_t byte) {
     struct ps2_uart_data *data = dev->data;
     int err;
 
+    // Set the response flag BEFORE the blocking write so it is already
+    // armed when write_finish() re-enables UART RX.  The TP sends its
+    // ACK byte ~67µs after the last write bit — without this ordering
+    // the response can arrive before the flag is set and get routed to
+    // the callback queue as data, causing persistent packet desync.
+    // Drain any stale sem give from a previous timed-out response first.
+    k_sem_reset(&data->write_awaits_resp_sem);
+    data->write_awaits_resp = true;
+
     err = ps2_uart_write_byte_blocking(dev, byte);
     if (err) {
+        data->write_awaits_resp = false;
         return err;
     }
-
-    data->write_awaits_resp = true;
 
     err = k_sem_take(&data->write_awaits_resp_sem, PS2_UART_TIMEOUT_WRITE_AWAIT_RESPONSE);
 
@@ -887,6 +897,16 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
         LOG_ERR("Blocking write failed due to semaphore timeout for byte "
                 "0x%x: %d",
                 byte, err);
+
+        // Clean up stale write state — the SCL timeout or GPIO ISR
+        // may still be pending. Cancel them and restore read mode so
+        // UART RX is re-enabled. All operations are idempotent; if
+        // the ISR already ran, a stale sem give is drained by the
+        // next write_byte_start's initial k_sem_take(K_NO_WAIT).
+        k_work_cancel_delayable(&data->write_scl_timout);
+        ps2_uart_set_scl_callback_enabled(dev, false);
+        ps2_uart_set_mode_read(dev);
+        data->cur_write_status = PS2_UART_WRITE_STATUS_INACTIVE;
 
         return PS2_UART_E_WRITE_SEM_TIMEOUT;
     }
@@ -959,7 +979,10 @@ int ps2_uart_write_byte_start(const struct device *dev, uint8_t byte) {
     k_work_schedule_for_queue(&ps2_uart_work_queue, &data->write_scl_timout,
                               PS2_UART_TIMEOUT_WRITE_SCL_START);
 
-    k_mutex_unlock(&ps2_uart_write_mutex);
+    // NOTE: Do NOT unlock the mutex here. The calling thread (write_byte)
+    // holds the mutex for the entire write operation and unlocks it when
+    // the write completes or all retries are exhausted. write_finish()
+    // signals completion via k_sem_give (ISR-safe), not the mutex.
 
     return 0;
 }
@@ -1046,7 +1069,7 @@ void ps2_uart_write_scl_interrupt_handler_blocking(struct ps2_uart_data *data,
     } else {
         // TODO: Properly handle write ack errors
         LOG_WRN("Ack bit was invalid for write of 0x%x", data->cur_write_byte);
-        ps2_uart_write_finish(data->dev, true, "failed ack");
+        ps2_uart_write_finish(data->dev, false, "failed ack");
     }
 }
 
@@ -1089,7 +1112,7 @@ void ps2_uart_write_scl_interrupt_handler_async(struct ps2_uart_data *data,
         } else {
             // TODO: Properly handle write ack errors
             LOG_WRN("Ack bit was invalid for write of 0x%x", data->cur_write_byte);
-            ps2_uart_write_finish(data->dev, true, "failed ack");
+            ps2_uart_write_finish(data->dev, false, "failed ack");
         }
     } else {
         LOG_ERR("UART unknown TX bit number: %d", data->cur_write_pos);
@@ -1121,20 +1144,23 @@ void ps2_uart_write_finish(const struct device *dev, bool successful, char *desc
     err = ps2_uart_set_mode_read(dev);
     if (err != 0) {
         LOG_ERR("Could not configure driver for read mode: %d", err);
-        // Fall through — MUST still give write_lock and unlock the
-        // mutex, otherwise all future writes deadlock and RX stays
-        // dead (TP dies permanently). The next write cycle's
-        // set_mode_write() will handle the stale RX state.
+        // Fall through — MUST still give write_lock, otherwise all
+        // future writes deadlock and RX stays dead (TP dies permanently).
+        // The next write cycle's set_mode_write() will handle the
+        // stale RX state.
     }
 
     LOG_DBG("END WRITE: 0x%x\n", data->cur_write_byte);
 
     data->cur_write_byte = 0x0;
 
-    // Give the semaphore to allow write_byte_blocking to continue
+    // Give the semaphore to allow write_byte_blocking to continue.
+    // NOTE: Do NOT unlock the mutex here — write_finish is called
+    // from ISR or work queue context, neither of which owns the
+    // mutex. k_mutex_unlock from ISR is undefined behavior in
+    // Zephyr. The calling thread (write_byte) owns the mutex and
+    // unlocks it after all retries are exhausted.
     k_sem_give(&data->write_lock);
-
-    k_mutex_unlock(&ps2_uart_write_mutex);
 }
 
 /*
