@@ -1028,9 +1028,10 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
                          i + 1, cmd_bytes, resp.err);
                 if (i > 0 && cmd[0] == '\xe2') {
                     LOG_WRN("Partial 0xE2 extended command: %d/%d bytes sent. "
-                            "TP command parser state is uncertain until next "
-                            "successful command or self-reset.",
+                            "Sleeping 50ms to let TP command parser timeout "
+                            "and discard the partial sequence.",
                             i, cmd_bytes);
+                    k_msleep(50);
                 }
                 break;
             }
@@ -1042,6 +1043,12 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
         resp.err = ps2_write(ps2_device, *arg);
         if (resp.err) {
             snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not send arg (%d)", resp.err);
+            if (cmd[0] == '\xe2') {
+                LOG_WRN("0xE2 extended command sent but arg byte failed. "
+                        "Sleeping 50ms to let TP command parser timeout "
+                        "and discard the pending write.");
+                k_msleep(50);
+            }
         }
     }
 
