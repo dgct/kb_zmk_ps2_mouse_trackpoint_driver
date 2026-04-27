@@ -53,9 +53,11 @@ LOG_MODULE_REGISTER(ps2_uart);
 // Custom queue for calling the zephyr ps/2 callback.
 // We don't want to hand it off to that API in an ISR since that callback
 // could be using blocking functions.
-// But we also don't want to hand it off at a low priority, since the PS/2
-// packets must be dealt with quickly. So we use a fairly high priority.
-#define PS2_UART_WORK_QUEUE_CB_PRIORITY 2
+// Priority must be BELOW the BLE host stack (BT_RX_PRIO=8) to avoid
+// starving BLE connection event processing, which causes typing lag on
+// split peripherals that multiplex TP + keys over the same BLE link.
+// Priority 9 sits just below BT_RX and just above the write queue (10).
+#define PS2_UART_WORK_QUEUE_CB_PRIORITY 9
 #define PS2_UART_WORK_QUEUE_CB_STACK_SIZE 1024
 
 /*
