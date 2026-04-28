@@ -432,6 +432,7 @@ int zmk_mouse_ps2_tp_invert_x_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_invert_y_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_set_config_byte_direct(const struct device *dev, uint8_t desired);
+int zmk_mouse_ps2_set_sampling_rate(const struct device *dev, uint8_t sampling_rate);
 
 /*
  * Apply all TP register settings from data-> to hardware.
@@ -691,6 +692,13 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
         return;
     }
 
+    /* Clear the reporting flag early — before any commands that pass
+     * pause_reporting=true to send_cmd.  This prevents send_cmd and
+     * apply_all_settings from wrapping each command with F5 (disable
+     * reporting), which would cause a TARE recalibration if the user's
+     * finger is on the stick.  Matches the wake handler pattern. */
+    data->activity_reporting_on = false;
+
     /* Reset packet buffer — the self-reset 0xAA 0x00 sequence may have
      * left the buffer in a partial state. */
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
@@ -710,13 +718,11 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
     int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
 
     /* Force-enable reporting.  After a self-reset the TP reverts to
-     * reporting-disabled, but data->activity_reporting_on may still be
-     * true (never cleared).  Clear it first so that
-     * activity_reporting_enable() doesn't early-return, then send F4
-     * and re-enable the PS/2 callback.
+     * reporting-disabled, and we cleared activity_reporting_on above.
+     * activity_reporting_enable() will send F4 and re-enable the PS/2
+     * callback.
      * Retry with backoff — a single failed 0xF4 write would leave the
      * TP permanently dead. */
-    data->activity_reporting_on = false;
     int err;
     for (int attempt = 0; attempt < 3; attempt++) {
         err = zmk_mouse_ps2_activity_reporting_enable(dev);
