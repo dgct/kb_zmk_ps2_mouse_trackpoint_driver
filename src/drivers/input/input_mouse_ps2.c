@@ -357,6 +357,26 @@ struct zmk_mouse_ps2_data {
 #endif
 };
 
+// Compose the desired config byte from immutable DT flags.
+// No PS/2 I/O — pure bit arithmetic.
+static inline uint8_t zmk_mouse_ps2_tp_desired_config_byte(
+        const struct zmk_mouse_ps2_config *config) {
+    uint8_t byte = 0;
+    if (config->tp_press_to_select) {
+        byte |= (1u << MOUSE_PS2_TP_CONFIG_BIT_PRESS_TO_SELECT);
+    }
+    if (config->tp_x_invert) {
+        byte |= (1u << MOUSE_PS2_TP_CONFIG_BIT_INVERT_X);
+    }
+    if (config->tp_y_invert) {
+        byte |= (1u << MOUSE_PS2_TP_CONFIG_BIT_INVERT_Y);
+    }
+    if (config->tp_xy_swap) {
+        byte |= (1u << MOUSE_PS2_TP_CONFIG_BIT_SWAP_XY);
+    }
+    return byte;
+}
+
 // declare datas and configs for all devices
 // NOTES: Settings will be assigned to all devices via exposed api from behaviors
 #define ZMK_PS2_MOUSE_DEFINE_DATA_N_CFG(n)                  \
@@ -410,6 +430,7 @@ int zmk_mouse_ps2_tp_reach_set(const struct device *dev, int reach);
 int zmk_mouse_ps2_tp_invert_x_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_invert_y_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
+int zmk_mouse_ps2_tp_set_config_byte_direct(const struct device *dev, uint8_t desired);
 
 /*
  * Apply all TP register settings from data-> to hardware.
@@ -456,18 +477,28 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     APPLY_SETTING(zmk_mouse_ps2_tp_min_drag_set(dev, data->tp_min_drag));
     APPLY_SETTING(zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach));
 
+    // Blind-write the entire config byte (register 0x2C) in one shot.
+    // This covers PTS, InvertX, InvertY, SwapXY without a read-modify-write,
+    // eliminating the risk of preserving corrupted orientation bits from a
+    // garbled read.
+    {
+        uint8_t desired = zmk_mouse_ps2_tp_desired_config_byte(config);
+        APPLY_SETTING(zmk_mouse_ps2_tp_set_config_byte_direct(dev, desired));
+
+        // Verify the write took effect (nearly free — reporting already paused)
+        uint8_t readback;
+        int verify_err = zmk_mouse_ps2_tp_get_config_byte(dev, &readback);
+        if (verify_err == 0 && readback != desired) {
+            LOG_WRN("TP config byte mismatch: wrote 0x%02x, read 0x%02x — retrying",
+                    desired, readback);
+            APPLY_SETTING(zmk_mouse_ps2_tp_set_config_byte_direct(dev, desired));
+        } else if (verify_err == 0) {
+            LOG_INF("TP config byte: wrote 0x%02x, verified", desired);
+        }
+    }
+
     if (config->tp_press_to_select) {
-        APPLY_SETTING(zmk_mouse_ps2_tp_press_to_select_set(dev, true));
         APPLY_SETTING(zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold));
-    }
-    if (config->tp_x_invert) {
-        APPLY_SETTING(zmk_mouse_ps2_tp_invert_x_set(dev, true));
-    }
-    if (config->tp_y_invert) {
-        APPLY_SETTING(zmk_mouse_ps2_tp_invert_y_set(dev, true));
-    }
-    if (config->tp_xy_swap) {
-        APPLY_SETTING(zmk_mouse_ps2_tp_swap_xy_set(dev, true));
     }
 
 #undef APPLY_SETTING
@@ -1770,6 +1801,19 @@ int zmk_mouse_ps2_tp_get_config_byte(const struct device* dev, uint8_t *config_b
     }
 
     *config_byte = resp.resp_buffer[0];
+
+    return 0;
+}
+
+int zmk_mouse_ps2_tp_set_config_byte_direct(const struct device *dev, uint8_t desired) {
+    struct zmk_mouse_ps2_send_cmd_resp resp = zmk_mouse_ps2_send_cmd(
+        dev,
+        MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE, sizeof(MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE), &desired,
+        MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE_RESP_LEN, true);
+    if (resp.err) {
+        LOG_ERR("Could not write trackpoint config byte 0x%02x", desired);
+        return resp.err;
+    }
 
     return 0;
 }

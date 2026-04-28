@@ -594,6 +594,11 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
             // Ignore, because it is not a real error and happens frequently
         } else {
             LOG_WRN("UART RX detected error for byte 0x%x: %s (%d)", byte, err_str, err);
+            // Discard corrupted bytes — don't let them into the packet
+            // assembler, command response queue, or callback path.
+            // Write-awaits-resp: timeout → retry. Callback: packet timeout →
+            // alignment recovery. Data queue: read timeout → send_cmd fails.
+            return;
         }
     }
 
