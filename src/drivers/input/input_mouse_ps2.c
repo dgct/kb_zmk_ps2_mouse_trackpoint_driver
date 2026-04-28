@@ -732,9 +732,14 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
  * One-shot watchdog rescheduled on every incoming byte.  If no bytes
  * arrive for 5 seconds while reporting is supposed to be on, something
  * silently killed the TP.  Force-resend F4 and re-enable the callback.
- * Never gives up — backs off to 30s probes after the first 3 attempts.
- * When the TP recovers, activity_callback resets retries to 0 and the
- * watchdog returns to the normal 5s cadence.
+ *
+ * Escalation ladder:
+ *   Attempts 1-3: send F4 (Enable Data Reporting), 5s interval.
+ *   Attempt  4+:  send 0xFF (full reset), re-apply all settings via
+ *                 the self-reset work handler, 30s interval.
+ *
+ * Never gives up.  When the TP recovers, activity_callback resets
+ * retries to 0 and the watchdog returns to the normal 5s cadence.
  */
 static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
     struct k_work_delayable *dwork = (struct k_work_delayable *)work;
@@ -760,34 +765,45 @@ static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
     }
 
     int attempt = data->liveness_retries++;
+
     if (attempt < 3) {
+        /* --- Stage 1: lightweight F4 probe --- */
         LOG_WRN("TP liveness: attempt %d/3 — no data for %lld ms, sending F4",
                 attempt + 1, silence);
-    } else {
-        LOG_WRN("TP liveness: attempt %d — F4 probe (30s interval, %lld ms silence)",
-                attempt + 1, silence);
-    }
 
-    /* Force activity_reporting_on = false so activity_reporting_enable()
-     * doesn't early-return, then send F4 + re-enable the callback.
-     * If F4 fails, the flag stays false — that's fine, the reschedule
-     * below ensures we retry regardless. */
-    data->activity_reporting_on = false;
-    int err = zmk_mouse_ps2_activity_reporting_enable(dev);
-    if (err) {
-        LOG_ERR("TP liveness: failed to re-enable reporting (%d)", err);
-        /* Also try re-enabling the callback directly — if the F4
-         * write timed out, the callback may have been left disabled
-         * by the UART layer's write-mode transition. */
-        ps2_enable_callback(config->ps2_device);
-    }
+        data->activity_reporting_on = false;
+        int err = zmk_mouse_ps2_activity_reporting_enable(dev);
+        if (err) {
+            LOG_ERR("TP liveness: failed to re-enable reporting (%d)", err);
+            ps2_enable_callback(config->ps2_device);
+        }
 
-    /* Always reschedule — never give up.  The old code had a guard
-     * `if (!activity_reporting_on) return` that would kill the watchdog
-     * permanently after a single failed F4 attempt. */
-    if (attempt < 3) {
         k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
     } else {
+        /* --- Stage 2: escalate to full 0xFF reset --- */
+        LOG_WRN("TP liveness: attempt %d — F4 failed 3×, sending 0xFF reset "
+                "(%lld ms silence)", attempt + 1, silence);
+
+        int err = zmk_mouse_ps2_reset(dev, config->ps2_device);
+        if (err) {
+            LOG_ERR("TP liveness: 0xFF reset failed (%d)", err);
+            /* Still try re-enabling the callback in case the bus is
+             * stuck but partially functional. */
+            ps2_enable_callback(config->ps2_device);
+        } else {
+            /* Give the TP time to complete BAT (up to ~500ms). */
+            k_sleep(K_MSEC(600));
+
+            /* Reset the packet buffer — any partial state is stale
+             * after a full reset. */
+            zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+        }
+
+        /* Re-apply all settings and re-enable reporting.  Reuse the
+         * self-reset work handler which already does the full
+         * apply-all-settings + retry-F4 sequence. */
+        k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
+
         k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(30));
     }
 }
