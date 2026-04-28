@@ -1171,9 +1171,16 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
     if (pause_reporting == true && prev_activity_reporting_on == true) {
         LOG_DBG("Enabling mouse activity reporting...");
 
-        err = zmk_mouse_ps2_activity_reporting_enable(dev);
+        for (int retry = 0; retry < 3; retry++) {
+            err = zmk_mouse_ps2_activity_reporting_enable(dev);
+            if (err == 0) {
+                break;
+            }
+            LOG_WRN("send_cmd: F4 re-enable attempt %d/3 failed (%d)", retry + 1, err);
+            k_msleep(5);
+        }
         if (err) {
-            // Don' overwrite existing error
+            // Don't overwrite existing error
             if (resp.err == 0) {
                 resp.err = err;
                 snprintf(resp.err_msg, sizeof(resp.err_msg),
