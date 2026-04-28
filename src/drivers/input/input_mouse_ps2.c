@@ -399,12 +399,34 @@ int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
  * Apply all TP register settings from data-> to hardware.
  * Used by: init, self-reset recovery, idle PM wake.
  * Each _set() validates, sends the PS/2 command, and updates data-> on success.
+ *
+ * Optimization: if reporting is currently on, we disable it once (F5) before
+ * the batch and re-enable (F4) after, rather than letting each _set() call
+ * individually wrap with F5/F4.  This avoids ~13 redundant F5/F4 round-trips
+ * on the bus (saves ~25ms of PS/2 traffic).
  */
 static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
     const struct zmk_mouse_ps2_config *config = dev->config;
     int failures = 0;
     int total = 0;
+
+    /* If reporting is on, disable it once for the whole batch.
+     * The _set() functions pass pause_reporting=true to send_cmd(),
+     * but send_cmd() only actually sends F5/F4 when
+     * data->activity_reporting_on == true.  By disabling reporting
+     * here (which sets the flag to false), all _set() calls below
+     * will skip their individual F5/F4 wrapping. */
+    bool was_reporting = data->activity_reporting_on;
+    if (was_reporting) {
+        int err = zmk_mouse_ps2_activity_reporting_disable(dev);
+        if (err) {
+            LOG_ERR("TP settings: failed to disable reporting before batch (%d)", err);
+            /* Continue anyway — individual _set calls will still
+             * wrap with F5/F4 as before (no worse than status quo). */
+            was_reporting = false;
+        }
+    }
 
 #define APPLY_SETTING(call) do { total++; if ((call) != 0) { failures++; } } while (0)
 
@@ -433,6 +455,14 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     }
 
 #undef APPLY_SETTING
+
+    /* Re-enable reporting if we disabled it at the top. */
+    if (was_reporting) {
+        int err = zmk_mouse_ps2_activity_reporting_enable(dev);
+        if (err) {
+            LOG_ERR("TP settings: failed to re-enable reporting after batch (%d)", err);
+        }
+    }
 
     if (failures > 0) {
         LOG_ERR("TP settings: %d/%d failed to apply", failures, total);
