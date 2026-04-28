@@ -347,6 +347,7 @@ struct zmk_mouse_ps2_data {
     enum {
         TP_PM_UNINITIALIZED = 0, /* zero-init sentinel: listeners check != DORMANT, safe */
         TP_PM_ACTIVE,
+        TP_PM_ENTERING_DORMANT, /* phase 1 done, draining; phase 2 pending */
         TP_PM_DORMANT,
     } pm_state;
     struct k_work_delayable idle_pm_dormant_work;
@@ -1265,9 +1266,11 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
     const struct zmk_mouse_ps2_config *config = dev->config;
     int err;
 
-    if (data->pm_state == TP_PM_DORMANT) {
+    if (data->pm_state != TP_PM_ACTIVE) {
         return;
     }
+
+    data->pm_state = TP_PM_ENTERING_DORMANT;
 
     LOG_INF("TP idle PM: entering DORMANT (phase 1: disable callback)");
 
@@ -1301,10 +1304,11 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
     const struct zmk_mouse_ps2_config *config = dev->config;
     int err;
 
-    /* A wake may have been requested during the 5ms drain window.
-     * If so, the wake handler sets pm_state != DORMANT (it remains
-     * ACTIVE or UNINITIALIZED), and we should abort. */
-    if (data->pm_state == TP_PM_DORMANT) {
+    /* A wake or activity notification may have aborted the dormant
+     * transition during the 5ms drain window by resetting pm_state
+     * to ACTIVE.  Only proceed if we're still in ENTERING_DORMANT. */
+    if (data->pm_state != TP_PM_ENTERING_DORMANT) {
+        LOG_INF("TP idle PM: dormant phase 2 aborted (pm_state=%d)", data->pm_state);
         return;
     }
 
@@ -1342,6 +1346,32 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     const struct device *dev = data->dev;
     const struct zmk_mouse_ps2_config *config = dev->config;
     int err;
+
+    if (data->pm_state == TP_PM_ENTERING_DORMANT) {
+        /* Lightweight abort: phase 1 ran (callback disabled, liveness
+         * cancelled) but UART is still active and TP is still reporting.
+         * Just undo phase 1 and return to ACTIVE — no tare risk. */
+        LOG_INF("TP idle PM: aborting dormant transition (activity during drain)");
+
+        k_work_cancel_delayable(&data->idle_pm_dormant_finish_work);
+
+        err = ps2_enable_callback(config->ps2_device);
+        if (err) {
+            LOG_WRN("TP idle PM: ps2_enable_callback failed on abort (%d)", err);
+        }
+
+        data->pm_state = TP_PM_ACTIVE;
+
+        /* Restart liveness watchdog (phase 1 cancelled it) */
+        data->last_byte_time = k_uptime_get();
+        data->liveness_retries = 0;
+        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
+
+        /* Restart idle timer */
+        k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
+                                    K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+        return;
+    }
 
     if (data->pm_state != TP_PM_DORMANT) {
         return;
@@ -1411,8 +1441,17 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    RAM and may be lost if the TP internally reset during UART
      *    suspend (ESD, watchdog, power glitch on pinctrl transition).
      *    This is idempotent: if the TP retained its state, re-writing
-     *    the same values is harmless.  Cost: ~30ms of PS/2 traffic. */
+     *    the same values is harmless.  Cost: ~30ms of PS/2 traffic.
+     *
+     *    TARE FIX: clear activity_reporting_on BEFORE apply_all_settings
+     *    so it skips the F5→F4 wrapper.  The TP was never sent F5
+     *    during dormant entry, so sending F5 now would cause a baseline
+     *    recalibration (tare) — if the user's finger is on the stick,
+     *    the pressed position becomes the new zero and they must
+     *    release and re-press. */
     if (data->is_trackpoint) {
+        data->activity_reporting_on = false;
+
         int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
         if (failures > 0) {
             LOG_WRN("TP idle PM: %d setting(s) failed to re-apply", failures);
@@ -1420,10 +1459,13 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
             LOG_INF("TP idle PM: re-applied TP register settings");
         }
 
+        /* Reset packet buffer after settings — PS/2 traffic during
+         * register writes may leave partial bytes in the buffer. */
+        zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+
         /* Safety net: if the TP self-reset during suspend, it reverts
          * to reporting-disabled.  Force-send F4 to ensure reporting is
          * on regardless of the cached flag state. */
-        data->activity_reporting_on = false;
         err = zmk_mouse_ps2_activity_reporting_enable(dev);
         if (err) {
             LOG_ERR("TP idle PM: failed to re-enable reporting (%d)", err);
@@ -1446,8 +1488,14 @@ static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data) {
     /* Reschedule the idle timer — trackpoint is active.
      * Also cancel any in-progress dormant phase 2 (finish work) so
      * activity during the 5ms drain window aborts the transition.
-     * If phase 1 already disabled the PS/2 callback, re-enable it. */
-    if (k_work_cancel_delayable(&data->idle_pm_dormant_finish_work) != 0) {
+     * If phase 1 already disabled the PS/2 callback, re-enable it.
+     *
+     * k_work_cancel_delayable returns >0 if work was pending and
+     * successfully cancelled.  If it returns 0, the work is either
+     * idle (no transition in progress) or already executing (the
+     * narrow S8 race — let it complete; GPIO wake self-recovers). */
+    int cancel_ret = k_work_cancel_delayable(&data->idle_pm_dormant_finish_work);
+    if (cancel_ret > 0) {
         /* Phase 2 was pending — phase 1 already disabled the callback.
          * Re-enable it since we're aborting the dormant transition. */
         const struct device *dev = data->dev;
@@ -1456,6 +1504,14 @@ static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data) {
         if (err) {
             LOG_WRN("TP idle PM: ps2_enable_callback failed on abort (%d)", err);
         }
+
+        /* Restore pm_state — phase 1 set it to ENTERING_DORMANT */
+        data->pm_state = TP_PM_ACTIVE;
+
+        /* Restart liveness watchdog (phase 1 cancelled it) */
+        data->last_byte_time = k_uptime_get();
+        data->liveness_retries = 0;
+        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
     }
     k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
                                 K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
@@ -1478,7 +1534,8 @@ static int tp_idle_pm_activity_listener(const zmk_event_t *eh) {
 
     /* Wake all driver instances */
     #define TP_IDLE_PM_WAKE_N(n)                                              \
-        if (data##n.pm_state == TP_PM_DORMANT) {                              \
+        if (data##n.pm_state == TP_PM_DORMANT ||                              \
+            data##n.pm_state == TP_PM_ENTERING_DORMANT) {                     \
             k_work_submit_to_queue(&tp_mgmt_wq, &data##n.idle_pm_wake_work);  \
         }
     DT_INST_FOREACH_STATUS_OKAY(TP_IDLE_PM_WAKE_N)
@@ -1490,9 +1547,10 @@ ZMK_LISTENER(tp_idle_pm_activity, tp_idle_pm_activity_listener);
 ZMK_SUBSCRIPTION(tp_idle_pm_activity, zmk_activity_state_changed);
 
 static int tp_idle_pm_position_listener(const zmk_event_t *eh) {
-    /* Any key press/release — wake the TP if dormant */
+    /* Any key press/release — wake the TP if dormant or entering dormant */
     #define TP_IDLE_PM_POS_WAKE_N(n)                                          \
-        if (data##n.pm_state == TP_PM_DORMANT) {                              \
+        if (data##n.pm_state == TP_PM_DORMANT ||                              \
+            data##n.pm_state == TP_PM_ENTERING_DORMANT) {                     \
             k_work_submit_to_queue(&tp_mgmt_wq, &data##n.idle_pm_wake_work);  \
         }
     DT_INST_FOREACH_STATUS_OKAY(TP_IDLE_PM_POS_WAKE_N)
