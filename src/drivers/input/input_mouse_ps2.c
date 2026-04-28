@@ -695,6 +695,18 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
      * left the buffer in a partial state. */
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
+    /* Restore sampling rate — after a reset the TP reverts to the PS/2
+     * default of 100 samples/sec.  This is a standard PS/2 command
+     * (0xF3), not an extended register, so apply_all_settings (which
+     * only handles 0xE2 registers) does not cover it. */
+    if (data->sampling_rate != MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT) {
+        int rate_err = zmk_mouse_ps2_set_sampling_rate(dev, data->sampling_rate);
+        if (rate_err) {
+            LOG_ERR("TP self-reset recovery: failed to restore sampling rate %d (%d)",
+                    data->sampling_rate, rate_err);
+        }
+    }
+
     int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
 
     /* Force-enable reporting.  After a self-reset the TP reverts to
@@ -793,6 +805,16 @@ static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
         } else {
             /* Give the TP time to complete BAT (up to ~500ms). */
             k_sleep(K_MSEC(600));
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+            /* Re-check: idle PM may have started a dormant transition
+             * while we were sleeping.  Abort recovery — the wake
+             * handler will take over when the user next moves the TP. */
+            if (data->pm_state != TP_PM_ACTIVE) {
+                LOG_WRN("TP liveness: PM state changed during BAT wait, aborting");
+                return;
+            }
+#endif
 
             /* Reset the packet buffer — any partial state is stale
              * after a full reset. */
@@ -1489,6 +1511,17 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    release and re-press. */
     if (data->is_trackpoint) {
         data->activity_reporting_on = false;
+
+        /* Restore sampling rate — if the TP self-reset while the UART
+         * was suspended, it reverted to 100 samples/sec.  Idempotent
+         * if the TP retained its state. */
+        if (data->sampling_rate != MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT) {
+            int rate_err = zmk_mouse_ps2_set_sampling_rate(dev, data->sampling_rate);
+            if (rate_err) {
+                LOG_WRN("TP idle PM: failed to restore sampling rate %d (%d)",
+                        data->sampling_rate, rate_err);
+            }
+        }
 
         int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
         if (failures > 0) {
