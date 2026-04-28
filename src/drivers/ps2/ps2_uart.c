@@ -17,6 +17,13 @@
 
 #include <hal/nrf_uarte.h>
 
+#if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
+#include <mpsl_timeslot.h>
+#include <mpsl.h>
+#include <hal/nrf_timer.h>
+#include <mpsl_hwres.h>
+#endif /* IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION) */
+
 #define LOG_LEVEL CONFIG_PS2_LOG_LEVEL
 LOG_MODULE_REGISTER(ps2_uart);
 
@@ -209,6 +216,49 @@ static struct k_work_q ps2_uart_work_queue;
 
 K_THREAD_STACK_DEFINE(ps2_uart_work_queue_cb_stack_area, PS2_UART_WORK_QUEUE_CB_STACK_SIZE);
 static struct k_work_q ps2_uart_work_queue_cb;
+
+/*
+ * MPSL Timeslot Protection
+ */
+
+#if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
+
+// Timeslot length: must cover worst-case PS/2 write time (~5.4ms) with margin.
+// TIMER0 fires 500µs before end to cleanly return ACTION_END.
+#define PS2_UART_TIMESLOT_LENGTH_US 8000
+#define PS2_UART_TIMESLOT_TIMER_EXPIRY_US (PS2_UART_TIMESLOT_LENGTH_US - 500)
+
+// How long to wait for MPSL to schedule the timeslot before giving up
+// and writing unprotected (2 BLE connection intervals at 7.5ms).
+#define PS2_UART_TIMESLOT_TIMEOUT_US 15000
+
+// Polling interval while waiting for timeslot grant
+#define PS2_UART_TIMESLOT_POLL_INTERVAL_US 10
+
+// Max poll iterations as safety net (timeout_us / poll_interval_us)
+#define PS2_UART_TIMESLOT_MAX_POLL_ITERS \
+    (PS2_UART_TIMESLOT_TIMEOUT_US / PS2_UART_TIMESLOT_POLL_INTERVAL_US)
+
+// Atomic flags for signal handler → thread communication.
+// Signal handler runs at priority 0, cannot use kernel APIs.
+static atomic_t ts_started = ATOMIC_INIT(0);
+static atomic_t ts_blocked = ATOMIC_INIT(0);
+
+static mpsl_timeslot_signal_return_param_t ts_return_param;
+static mpsl_timeslot_session_id_t ts_session_id;
+static bool ts_session_open;
+
+static mpsl_timeslot_request_t ts_request_earliest = {
+    .request_type = MPSL_TIMESLOT_REQ_TYPE_EARLIEST,
+    .params.earliest = {
+        .hfclk = MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE,
+        .priority = MPSL_TIMESLOT_PRIORITY_NORMAL,
+        .length_us = PS2_UART_TIMESLOT_LENGTH_US,
+        .timeout_us = PS2_UART_TIMESLOT_TIMEOUT_US,
+    },
+};
+
+#endif /* IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION) */
 
 /*
  * Function Definitions
@@ -705,6 +755,126 @@ void ps2_uart_write_finish(const struct device *dev, bool successful, char *desc
 // device responded with 0xfc (failure / cancel).
 #define PS2_UART_E_WRITE_FAILURE 5
 
+/*
+ * MPSL Timeslot Functions
+ */
+
+#if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
+
+// Signal callback — runs at priority 0 (ZLI context).
+// MUST NOT use any kernel APIs (k_sem, k_work, LOG, etc).
+// Only atomic ops and direct HW register writes are safe here.
+static mpsl_timeslot_signal_return_param_t *ps2_uart_timeslot_cb(
+    mpsl_timeslot_session_id_t session_id, uint32_t signal_type)
+{
+    (void)session_id;
+
+    switch (signal_type) {
+    case MPSL_TIMESLOT_SIGNAL_START:
+        // Timeslot granted. Set up TIMER0 to fire before timeslot ends
+        // so we can return ACTION_END cleanly.
+        nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0,
+                         PS2_UART_TIMESLOT_TIMER_EXPIRY_US);
+        nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
+
+        // Signal the polling thread that timeslot is active
+        atomic_set(&ts_started, 1);
+
+        ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_NONE;
+        return &ts_return_param;
+
+    case MPSL_TIMESLOT_SIGNAL_TIMER0:
+        // Timer expired — end the timeslot cleanly
+        nrf_timer_int_disable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
+        nrf_timer_event_clear(MPSL_TIMER0, NRF_TIMER_EVENT_COMPARE0);
+
+        atomic_set(&ts_started, 0);
+
+        ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_END;
+        return &ts_return_param;
+
+    case MPSL_TIMESLOT_SIGNAL_BLOCKED:
+    case MPSL_TIMESLOT_SIGNAL_CANCELLED:
+        // MPSL couldn't schedule the timeslot. Signal the polling thread
+        // to fall through to an unprotected write.
+        atomic_set(&ts_blocked, 1);
+
+        ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_NONE;
+        return &ts_return_param;
+
+    default:
+        ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_NONE;
+        return &ts_return_param;
+    }
+}
+
+// Open a timeslot session during driver init. Called once.
+static int ps2_uart_timeslot_init(void)
+{
+    int err;
+
+    if (ts_session_open) {
+        return 0;
+    }
+
+    err = mpsl_timeslot_session_open(ps2_uart_timeslot_cb, &ts_session_id);
+    if (err) {
+        LOG_ERR("MPSL timeslot session open failed: %d", err);
+        return err;
+    }
+
+    ts_session_open = true;
+    LOG_INF("MPSL timeslot session opened (id=%u) for PS/2 write protection",
+            ts_session_id);
+
+    return 0;
+}
+
+// Request a timeslot and poll until granted or blocked.
+// Returns 0 if timeslot is active, -EBUSY if blocked/timed out.
+static int ps2_uart_timeslot_acquire(void)
+{
+    int err;
+
+    if (!ts_session_open) {
+        return -ENODEV;
+    }
+
+    atomic_set(&ts_started, 0);
+    atomic_set(&ts_blocked, 0);
+
+    err = mpsl_timeslot_request(ts_session_id, &ts_request_earliest);
+    if (err) {
+        LOG_WRN("MPSL timeslot request failed: %d", err);
+        return -EBUSY;
+    }
+
+    // Poll until signal handler sets one of the flags.
+    // Our thread is cooperative (prio 10) and k_busy_wait doesn't yield,
+    // so no rescheduling happens during the poll — only ISRs fire and return.
+    for (int i = 0; i < PS2_UART_TIMESLOT_MAX_POLL_ITERS; i++) {
+        if (atomic_get(&ts_started)) {
+            return 0;
+        }
+        if (atomic_get(&ts_blocked)) {
+            LOG_WRN("MPSL timeslot blocked, proceeding with unprotected write");
+            return -EBUSY;
+        }
+        k_busy_wait(PS2_UART_TIMESLOT_POLL_INTERVAL_US);
+    }
+
+    LOG_WRN("MPSL timeslot poll timed out, proceeding with unprotected write");
+    return -ETIMEDOUT;
+}
+
+// Mark that we're done with the timeslot. TIMER0 will end it naturally.
+static void ps2_uart_timeslot_release(void)
+{
+    atomic_set(&ts_started, 0);
+}
+
+#endif /* IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION) */
+
 K_MUTEX_DEFINE(ps2_uart_write_mutex);
 
 int ps2_uart_write_byte_debug(const struct device *dev, uint8_t byte) {
@@ -880,11 +1050,23 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
     struct ps2_uart_data *data = dev->data;
     int err;
 
+#if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
+    // Acquire an MPSL timeslot to protect the bit-bang write from
+    // BLE radio ZLI preemption. If acquisition fails, we proceed
+    // with an unprotected write (same as pre-timeslot behavior).
+    int ts_err = ps2_uart_timeslot_acquire();
+#endif
+
     // LOG_DBG("ps2_uart_write_byte_blocking called with byte=0x%x", byte);
 
     err = ps2_uart_write_byte_start(dev, byte);
     if (err) {
         LOG_ERR("Could not initiate writing of byte.");
+#if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
+        if (ts_err == 0) {
+            ps2_uart_timeslot_release();
+        }
+#endif
         return PS2_UART_E_WRITE_TRANSMIT;
     }
 
@@ -913,8 +1095,19 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
         ps2_uart_set_mode_read(dev);
         data->cur_write_status = PS2_UART_WRITE_STATUS_INACTIVE;
 
+#if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
+        if (ts_err == 0) {
+            ps2_uart_timeslot_release();
+        }
+#endif
         return PS2_UART_E_WRITE_SEM_TIMEOUT;
     }
+
+#if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
+    if (ts_err == 0) {
+        ps2_uart_timeslot_release();
+    }
+#endif
 
     if (data->cur_write_status == PS2_UART_WRITE_STATUS_SUCCESS) {
         // LOG_DBG("Blocking write finished successfully for byte 0x%x", byte);
@@ -1361,6 +1554,14 @@ static int ps2_uart_init(const struct device *dev) {
         LOG_ERR("Could not initialize in UART mode read: %d", err);
         return err;
     }
+
+#if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
+    err = ps2_uart_timeslot_init();
+    if (err != 0) {
+        LOG_ERR("Could not init MPSL timeslot session: %d (writes will be unprotected)", err);
+        // Non-fatal: fall through to unprotected writes
+    }
+#endif
 
     return 0;
 }

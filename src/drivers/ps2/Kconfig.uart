@@ -18,6 +18,16 @@ config PS2_UART_WRITE_MODE_BLOCKING
 	bool "Don't use interrupts for writing data and instead block using timers."
 	default n
 
+config PS2_UART_TIMESLOT_PROTECTION
+	bool "Wrap PS/2 writes in an MPSL timeslot to prevent BLE radio ZLI preemption"
+	depends on ZMK_BT_LL_SOFTDEVICE
+	default n
+	help
+	  When enabled, each PS/2 GPIO bit-bang write is wrapped in an MPSL
+	  timeslot. This prevents the SoftDevice Controller's zero-latency
+	  RADIO/TIMER0 ISRs from corrupting PS/2 write timing.
+	  Requires CONFIG_MPSL_TIMESLOT_SESSION_COUNT >= 1.
+
 config PS2_UART_CUSTOM_BAUDRATE_REG
 	hex "Override the nRF UARTE BAUDRATE register with a custom value (0 = no override). Use to fine-tune baud rate beyond the standard Zephyr UART driver presets. For example, 0x003D2000 gives ~14925 baud on the nRF52840 (16 MHz HFCLK)."
 	default 0x0
