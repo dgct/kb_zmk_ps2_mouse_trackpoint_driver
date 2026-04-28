@@ -732,18 +732,25 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
  * One-shot watchdog rescheduled on every incoming byte.  If no bytes
  * arrive for 5 seconds while reporting is supposed to be on, something
  * silently killed the TP.  Force-resend F4 and re-enable the callback.
- * Gives up after 2 consecutive attempts to avoid hammering a truly
- * dead device.
+ * Never gives up — backs off to 30s probes after the first 3 attempts.
+ * When the TP recovers, activity_callback resets retries to 0 and the
+ * watchdog returns to the normal 5s cadence.
  */
 static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
     struct k_work_delayable *dwork = (struct k_work_delayable *)work;
     struct zmk_mouse_ps2_data *data = CONTAINER_OF(dwork, struct zmk_mouse_ps2_data,
                                                    liveness_watchdog);
     const struct device *dev = data->dev;
+    const struct zmk_mouse_ps2_config *config = dev->config;
 
-    if (!data->activity_reporting_on) {
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+    /* Don't probe while dormant or entering dormant — the UART may be
+     * suspended and no bytes are expected.  The wake handler restarts
+     * the watchdog when it returns to ACTIVE. */
+    if (data->pm_state != TP_PM_ACTIVE) {
         return;
     }
+#endif
 
     int64_t silence = k_uptime_get() - data->last_byte_time;
     if (silence < 5000) {
@@ -761,18 +768,26 @@ static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
                 attempt + 1, silence);
     }
 
+    /* Force activity_reporting_on = false so activity_reporting_enable()
+     * doesn't early-return, then send F4 + re-enable the callback.
+     * If F4 fails, the flag stays false — that's fine, the reschedule
+     * below ensures we retry regardless. */
     data->activity_reporting_on = false;
     int err = zmk_mouse_ps2_activity_reporting_enable(dev);
     if (err) {
         LOG_ERR("TP liveness: failed to re-enable reporting (%d)", err);
+        /* Also try re-enabling the callback directly — if the F4
+         * write timed out, the callback may have been left disabled
+         * by the UART layer's write-mode transition. */
+        ps2_enable_callback(config->ps2_device);
     }
 
+    /* Always reschedule — never give up.  The old code had a guard
+     * `if (!activity_reporting_on) return` that would kill the watchdog
+     * permanently after a single failed F4 attempt. */
     if (attempt < 3) {
         k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
     } else {
-        /* Backed-off probe: keep trying F4 every 30s, never give up.
-         * If the TP recovers, activity_callback resets retries to 0
-         * and we return to the normal 5s cadence. */
         k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(30));
     }
 }
