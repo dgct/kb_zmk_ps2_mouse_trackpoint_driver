@@ -19,6 +19,7 @@
 #include <zephyr/sys/util.h>
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+#include <zephyr/drivers/uart.h>
 #include <zephyr/pm/device.h>
 #include <zmk/activity.h>
 #include <zmk/event_manager.h>
@@ -217,6 +218,21 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #define MOUSE_PS2_THREAD_STACK_SIZE 2048
 #define MOUSE_PS2_THREAD_PRIORITY 10
+
+/*
+ * Dedicated work queue for TP management operations (self-reset recovery,
+ * liveness watchdog, idle PM wake/dormant).  These involve blocking PS/2
+ * writes that would otherwise stall the system workqueue for 50-80 ms on
+ * a healthy bus and potentially seconds on a degraded one.
+ *
+ * Priority 10: below sysworkq (-1), BLE (-8), and the PS/2 callback WQ
+ * (prio 9) so byte delivery is never starved by management work.
+ */
+#define TP_MGMT_WQ_STACK_SIZE 2048
+#define TP_MGMT_WQ_PRIORITY 10
+K_THREAD_STACK_DEFINE(tp_mgmt_wq_stack, TP_MGMT_WQ_STACK_SIZE);
+static struct k_work_q tp_mgmt_wq;
+static bool tp_mgmt_wq_started;
 
 /*
  * Global Variables
@@ -489,7 +505,7 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
 
     data->last_byte_time = k_uptime_get();
     data->liveness_retries = 0;
-    k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
+    k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
 
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
@@ -521,7 +537,7 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
             if (byte == 0x00) {
                 LOG_WRN("TP self-reset detected (0xAA 0x00). "
                         "Scheduling re-apply of all TP settings.");
-                k_work_submit(&data->tp_self_reset_work);
+                k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
             } else {
                 LOG_WRN("Got 0xAA followed by 0x%02x (not 0x00). "
                         "Ignoring as spurious.", byte);
@@ -700,21 +716,32 @@ static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
     int64_t silence = k_uptime_get() - data->last_byte_time;
     if (silence < 5000) {
         /* A byte arrived between scheduling and firing; reschedule. */
-        k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
+        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
         return;
     }
 
-    LOG_WRN("TP liveness: no data for %lld ms, forcing reporting re-enable", silence);
+    int attempt = data->liveness_retries++;
+    if (attempt < 3) {
+        LOG_WRN("TP liveness: attempt %d/3 — no data for %lld ms, sending F4",
+                attempt + 1, silence);
+    } else {
+        LOG_WRN("TP liveness: attempt %d — F4 probe (30s interval, %lld ms silence)",
+                attempt + 1, silence);
+    }
+
     data->activity_reporting_on = false;
     int err = zmk_mouse_ps2_activity_reporting_enable(dev);
     if (err) {
         LOG_ERR("TP liveness: failed to re-enable reporting (%d)", err);
     }
 
-    if (data->liveness_retries++ < 2) {
-        k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
+    if (attempt < 3) {
+        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
     } else {
-        LOG_ERR("TP liveness: giving up after %d attempts", data->liveness_retries);
+        /* Backed-off probe: keep trying F4 every 30s, never give up.
+         * If the TP recovers, activity_callback resets retries to 0
+         * and we return to the normal 5s cadence. */
+        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(30));
     }
 }
 
@@ -1194,7 +1221,7 @@ static void tp_idle_pm_wake_gpio_isr(const struct device *port,
      * and resumes the UART in thread context (the nRF GPIO driver's
      * interrupt reconfigure can grab a spinlock, which we'd rather
      * not do from ISR). */
-    k_work_submit(&data->idle_pm_wake_work);
+    k_work_submit_to_queue(&tp_mgmt_wq, &data->idle_pm_wake_work);
 }
 
 static void tp_idle_pm_dormant_finish_handler(struct k_work *work);
@@ -1232,7 +1259,7 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
      *    This replaces the old k_sleep(5ms) that blocked the system
      *    workqueue. The delayable work yields back to sysworkq, so
      *    other work items (BLE, display) can run in the gap. */
-    k_work_schedule(&data->idle_pm_dormant_finish_work, K_MSEC(5));
+    k_work_schedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_finish_work, K_MSEC(5));
 }
 
 static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
@@ -1332,6 +1359,12 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* 3. Re-enable the PS/2 callback (reporting was never disabled,
      *    so no F4 is needed). */
     err = ps2_enable_callback(config->ps2_device);
+
+    /* 3b. Restore the UART error interrupt which the Zephyr nRF UARTE
+     *     PM driver does not save/restore across suspend/resume
+     *     (only ENDRX is preserved).  Without this, framing/parity
+     *     errors after wake are silently swallowed. */
+    uart_irq_err_enable(data->uart_dev);
     if (err) {
         LOG_ERR("TP idle PM: ps2_enable_callback failed (%d)", err);
     }
@@ -1371,11 +1404,11 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* Restart the liveness watchdog now that the UART is live again. */
     data->last_byte_time = k_uptime_get();
     data->liveness_retries = 0;
-    k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
+    k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
 
     /* Restart the idle timer */
-    k_work_reschedule(&data->idle_pm_dormant_work,
-                      K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+    k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
+                                K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
 }
 
 static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data) {
@@ -1393,8 +1426,8 @@ static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data) {
             LOG_WRN("TP idle PM: ps2_enable_callback failed on abort (%d)", err);
         }
     }
-    k_work_reschedule(&data->idle_pm_dormant_work,
-                      K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+    k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
+                                K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
 }
 
 /*
@@ -1415,7 +1448,7 @@ static int tp_idle_pm_activity_listener(const zmk_event_t *eh) {
     /* Wake all driver instances */
     #define TP_IDLE_PM_WAKE_N(n)                                              \
         if (data##n.pm_state == TP_PM_DORMANT) {                              \
-            k_work_submit(&data##n.idle_pm_wake_work);                        \
+            k_work_submit_to_queue(&tp_mgmt_wq, &data##n.idle_pm_wake_work);  \
         }
     DT_INST_FOREACH_STATUS_OKAY(TP_IDLE_PM_WAKE_N)
 
@@ -1429,7 +1462,7 @@ static int tp_idle_pm_position_listener(const zmk_event_t *eh) {
     /* Any key press/release — wake the TP if dormant */
     #define TP_IDLE_PM_POS_WAKE_N(n)                                          \
         if (data##n.pm_state == TP_PM_DORMANT) {                              \
-            k_work_submit(&data##n.idle_pm_wake_work);                        \
+            k_work_submit_to_queue(&tp_mgmt_wq, &data##n.idle_pm_wake_work);  \
         }
     DT_INST_FOREACH_STATUS_OKAY(TP_IDLE_PM_POS_WAKE_N)
 
@@ -2906,7 +2939,17 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     } else {
         LOG_DBG("Successfully activated ps2 callback");
         data->last_byte_time = k_uptime_get();
-        k_work_schedule(&data->liveness_watchdog, K_SECONDS(5));
+
+        if (!tp_mgmt_wq_started) {
+            k_work_queue_init(&tp_mgmt_wq);
+            k_work_queue_start(&tp_mgmt_wq, tp_mgmt_wq_stack,
+                               K_THREAD_STACK_SIZEOF(tp_mgmt_wq_stack),
+                               TP_MGMT_WQ_PRIORITY, NULL);
+            k_thread_name_set(&tp_mgmt_wq.thread, "tp_mgmt");
+            tp_mgmt_wq_started = true;
+        }
+
+        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
     }
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
@@ -2945,8 +2988,8 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     }
 
     /* Start the idle timer */
-    k_work_reschedule(&data->idle_pm_dormant_work,
-                      K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+    k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
+                                K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
     LOG_INF("TP idle PM: enabled (timeout %d ms, wake-gpio=%s)",
             CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS,
             config->has_wake_gpio ? "yes" : "no");
