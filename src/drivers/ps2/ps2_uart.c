@@ -16,6 +16,56 @@
 #include <zephyr/logging/log.h>
 
 #include <hal/nrf_uarte.h>
+#include <hal/nrf_gpiote.h>
+#include <hal/nrf_ppi.h>
+#include <hal/nrf_timer.h>
+#include <nrfx.h>
+
+/*
+ * Dual-UARTE Diversity Receiver (#2 + #5 with δ spread)
+ *
+ * CLK period is measured at boot via GPIOTE+PPI+TIMER3 to auto-calibrate
+ * the baud rate. UARTE0 runs at f*(1+δ) and a bare-metal UARTE1 runs at
+ * f*(1-δ) on the same DATA pin. When UARTE0 gets a framing error, the
+ * driver falls back to UARTE1's byte if it decoded cleanly.
+ */
+
+/* δ spread percentage (×100 for integer math: 200 = 2.00%) */
+#define PS2_UART_DIVERSITY_DELTA_PERCENT 2
+
+/* CLK calibration: number of edges to sample and expected tick range */
+#define PS2_UART_CAL_EDGES           16
+#define PS2_UART_CAL_MIN_TICKS      950   /* ~16.8 kHz */
+#define PS2_UART_CAL_MAX_TICKS     1200   /* ~13.3 kHz */
+#define PS2_UART_CAL_TIMEOUT_US   50000   /* 50 ms max wait per edge */
+
+/* GPIOTE channel and PPI channel for calibration (lowest = safest) */
+#define PS2_UART_CAL_GPIOTE_CH       0
+#define PS2_UART_CAL_PPI_CH          0
+
+/* Diversity receiver state */
+static volatile uint8_t  uarte1_dma_buf;
+static volatile uint8_t  uarte1_last_byte;
+static volatile uint32_t uarte1_last_err;
+static volatile bool     uarte1_byte_ready;
+static bool              uarte1_initialized;
+
+/* Error counters */
+static uint32_t diversity_err_uarte0_framing;
+static uint32_t diversity_err_uarte0_other;
+static uint32_t diversity_err_uarte1_recovered;
+static uint32_t diversity_err_both_failed;
+static uint32_t diversity_byte_count;
+
+/* Calibrated baud registers */
+static uint32_t diversity_baud_center;
+static uint32_t diversity_baud_fast;
+static uint32_t diversity_baud_slow;
+
+/* Periodic stats logging */
+static void diversity_stats_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(diversity_stats_work, diversity_stats_work_handler);
+#define PS2_UART_DIVERSITY_STATS_INTERVAL_MS 10000
 
 #if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
 #include <mpsl_timeslot.h>
@@ -387,6 +437,9 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
     nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_ENDRX);
     nrf_uarte_task_trigger(NRF_UARTE0, NRF_UARTE_TASK_STARTRX);
 
+    // Restart diversity receiver
+    ps2_uart_diversity_start_rx();
+
     // Enable UART interrupt
     uart_irq_rx_enable(config->uart_dev);
 
@@ -423,6 +476,9 @@ static int ps2_uart_set_mode_write(const struct device *dev) {
     } else {
         uart_irq_rx_disable(config->uart_dev);
     }
+
+    // Stop diversity receiver before disconnecting pin
+    ps2_uart_diversity_stop_rx();
 
     // Now safe to disconnect the RX pin — DMA is fully stopped
     err = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_SLEEP);
@@ -601,6 +657,11 @@ static int ps2_uart_read_err_check(const struct device *dev);
 void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte);
 const char *ps2_uart_read_get_error_str(int err);
 
+/* Diversity receiver forward declarations */
+static int ps2_uart_diversity_check_err(uint32_t errorsrc);
+static void ps2_uart_diversity_stop_rx(void);
+static void ps2_uart_diversity_start_rx(void);
+
 static void ps2_uart_interrupt_handler(const struct device *uart_dev, void *user_data) {
     // const struct device* dev = (const struct device*)user_data;
     int err;
@@ -662,6 +723,8 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
 
     LOG_DBG("UART Received: 0x%x", byte);
 
+    diversity_byte_count++;
+
     err = ps2_uart_read_err_check(config->uart_dev);
     if (err != 0) {
         const char *err_str = ps2_uart_read_get_error_str(err);
@@ -671,16 +734,48 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
         if (byte == 0xfa && err == UART_ERROR_FRAMING) {
             // Ignore, because it is not a real error and happens frequently
         } else {
-            LOG_WRN("UART RX detected error for byte 0x%x: %s (%d)", byte, err_str, err);
-            // Discard corrupted bytes — don't let them into the packet
-            // assembler, command response queue, or callback path.
-            // Write-awaits-resp: timeout → retry. Callback: packet timeout →
-            // alignment recovery. Data queue: read timeout → send_cmd fails.
-            return;
+            // Diversity fallback: try UARTE1's byte if available
+            if (err == UART_ERROR_FRAMING) {
+                diversity_err_uarte0_framing++;
+            } else {
+                diversity_err_uarte0_other++;
+            }
+
+            if (uarte1_byte_ready) {
+                int u1_err = ps2_uart_diversity_check_err(uarte1_last_err);
+                uint8_t u1_byte = uarte1_last_byte;
+                uarte1_byte_ready = false;
+
+                if (u1_err == 0) {
+                    // UARTE1 decoded cleanly — use its byte
+                    diversity_err_uarte1_recovered++;
+                    LOG_INF("Diversity: UARTE1 recovered byte 0x%02x "
+                            "(UARTE0 had %s for 0x%02x)",
+                            u1_byte, err_str, byte);
+                    byte = u1_byte;
+                    err = 0;
+                    // Fall through to normal processing below
+                } else {
+                    // Both UARTEs failed
+                    diversity_err_both_failed++;
+                    LOG_WRN("Diversity: both UARTEs failed for byte "
+                            "(u0=0x%02x %s, u1=0x%02x %s)",
+                            byte, err_str,
+                            u1_byte, ps2_uart_read_get_error_str(u1_err));
+                    return;
+                }
+            } else {
+                LOG_WRN("UART RX detected error for byte 0x%x: %s (%d)",
+                        byte, err_str, err);
+                // Discard corrupted bytes — don't let them into the packet
+                // assembler, command response queue, or callback path.
+                return;
+            }
         }
     }
 
-    LOG_DBG("Received byte: 0x%x", byte);
+    // Consume UARTE1's byte even on success (stay in sync)
+    uarte1_byte_ready = false;
 
     // If write_byte_await_response() is waiting, we notify
     // the blocked write process of whether it was a success or not.
@@ -1498,6 +1593,301 @@ static const struct ps2_driver_api ps2_uart_driver_api = {
 };
 
 /*
+ * Dual-UARTE Diversity: CLK Calibration & UARTE1 Setup
+ */
+
+/**
+ * Measure the PS/2 CLK period using GPIOTE + PPI + TIMER3.
+ *
+ * Captures falling-edge timestamps on P0.20 (CLK) via hardware PPI path
+ * (zero CPU jitter). Returns the average CLK period in TIMER3 ticks
+ * (16 MHz clock, 62.5 ns/tick), or 0 on failure.
+ *
+ * Resources are fully torn down after measurement.
+ */
+static uint32_t ps2_uart_calibrate_clk_period(const struct device *dev) {
+    const struct ps2_uart_config *config = dev->config;
+    uint32_t deltas[PS2_UART_CAL_EDGES];
+    uint32_t prev_ts = 0;
+    int count = 0;
+
+    /* --- Configure TIMER3: 16 MHz, 32-bit, timer mode --- */
+    nrf_timer_mode_set(NRF_TIMER3, NRF_TIMER_MODE_TIMER);
+    nrf_timer_bit_width_set(NRF_TIMER3, NRF_TIMER_BIT_WIDTH_32);
+    nrf_timer_prescaler_set(NRF_TIMER3, NRF_TIMER_FREQ_16MHz);
+    nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_CLEAR);
+    nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_START);
+
+    /* --- Configure GPIOTE CH[n]: Event mode, falling edge on CLK pin --- */
+    nrf_gpiote_event_configure(NRF_GPIOTE, PS2_UART_CAL_GPIOTE_CH,
+                               config->scl_gpio.pin,
+                               NRF_GPIOTE_POLARITY_HITOLO);
+    nrf_gpiote_event_enable(NRF_GPIOTE, PS2_UART_CAL_GPIOTE_CH);
+
+    /* --- Configure PPI: GPIOTE IN[n] → TIMER3 CAPTURE[0] --- */
+    nrf_ppi_channel_endpoint_setup(
+        NRF_PPI, (nrf_ppi_channel_t)PS2_UART_CAL_PPI_CH,
+        nrf_gpiote_event_address_get(NRF_GPIOTE,
+                                     nrf_gpiote_in_event_get(PS2_UART_CAL_GPIOTE_CH)),
+        nrf_timer_task_address_get(NRF_TIMER3, NRF_TIMER_TASK_CAPTURE0));
+    nrf_ppi_channel_enable(NRF_PPI, (nrf_ppi_channel_t)PS2_UART_CAL_PPI_CH);
+
+    /* --- Sample CLK edges --- */
+    for (int i = 0; i < PS2_UART_CAL_EDGES; i++) {
+        nrf_gpiote_event_clear(NRF_GPIOTE,
+                               nrf_gpiote_in_event_get(PS2_UART_CAL_GPIOTE_CH));
+
+        int timeout_us = PS2_UART_CAL_TIMEOUT_US;
+        while (!nrf_gpiote_event_check(NRF_GPIOTE,
+                                       nrf_gpiote_in_event_get(PS2_UART_CAL_GPIOTE_CH))) {
+            k_busy_wait(1);
+            if (--timeout_us <= 0) {
+                LOG_WRN("CLK calibration: timeout waiting for edge %d", i);
+                goto teardown;
+            }
+        }
+
+        uint32_t ts = nrf_timer_cc_get(NRF_TIMER3, NRF_TIMER_CC_CHANNEL0);
+
+        if (i > 0) {
+            /* Unsigned subtraction handles 32-bit wrap correctly */
+            uint32_t delta = ts - prev_ts;
+            if (delta >= PS2_UART_CAL_MIN_TICKS &&
+                delta <= PS2_UART_CAL_MAX_TICKS) {
+                deltas[count++] = delta;
+            }
+        }
+        prev_ts = ts;
+    }
+
+teardown:
+    /* --- Release all resources --- */
+    nrf_ppi_channel_disable(NRF_PPI, (nrf_ppi_channel_t)PS2_UART_CAL_PPI_CH);
+    nrf_gpiote_event_disable(NRF_GPIOTE, PS2_UART_CAL_GPIOTE_CH);
+    nrf_gpiote_te_default(NRF_GPIOTE, PS2_UART_CAL_GPIOTE_CH);
+    nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_STOP);
+    nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_CLEAR);
+
+    if (count < 4) {
+        LOG_WRN("CLK calibration: only %d valid samples, need >= 4", count);
+        return 0;
+    }
+
+    /* Average valid deltas */
+    uint64_t sum = 0;
+    for (int i = 0; i < count; i++) {
+        sum += deltas[i];
+    }
+    uint32_t avg = (uint32_t)(sum / count);
+
+    LOG_INF("CLK calibration: %d samples, avg period = %u ticks (%.1f kHz)",
+            count, avg, 16000.0f / avg);
+
+    return avg;
+}
+
+/**
+ * Compute BAUDRATE register value from a CLK period in timer ticks.
+ * TIMER3 runs at 16 MHz, so: baud = 16e6 / ticks, REG = baud * 2^32 / 16e6
+ * Simplifies to: REG = 2^32 / ticks
+ */
+static uint32_t ps2_uart_ticks_to_baud_reg(uint32_t ticks) {
+    return (uint32_t)(0x100000000ULL / ticks);
+}
+
+/**
+ * UARTE1 ISR — bare-metal interrupt handler for the diversity receiver.
+ *
+ * Fires ~30 µs after UARTE0's ISR due to the slower baud rate. Captures
+ * the received byte and error state for the decision logic in
+ * ps2_uart_read_process_received_byte().
+ */
+ISR_DIRECT_DECLARE(uarte1_diversity_isr) {
+    if (nrf_uarte_event_check(NRF_UARTE1, NRF_UARTE_EVENT_ERROR)) {
+        nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
+        /* Errors are read from ERRORSRC in the ENDRX path below */
+    }
+
+    if (nrf_uarte_event_check(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX)) {
+        nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
+
+        uarte1_last_byte = uarte1_dma_buf;
+        uarte1_last_err = NRF_UARTE1->ERRORSRC;
+        NRF_UARTE1->ERRORSRC = uarte1_last_err;  /* W1C clear */
+        uarte1_byte_ready = true;
+
+        /* Re-arm DMA for next byte (PTR/MAXCNT survive) */
+        nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
+    }
+
+    ISR_DIRECT_PM();
+    return 1;  /* Do not invoke Zephyr scheduling */
+}
+
+/**
+ * Initialize the diversity receiver: calibrate CLK, configure UARTE1.
+ * Called from ps2_uart_init_uart() after Zephyr's UARTE0 is configured.
+ */
+static int ps2_uart_diversity_init(const struct device *dev) {
+    /* Phase 1: Measure CLK period */
+    uint32_t clk_ticks = ps2_uart_calibrate_clk_period(dev);
+    if (clk_ticks == 0) {
+        LOG_WRN("Diversity: CLK calibration failed, using hardcoded baud");
+        /* Fall back to the existing CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG */
+        return -ENODATA;
+    }
+
+    /* Compute center baud and δ-spread registers */
+    diversity_baud_center = ps2_uart_ticks_to_baud_reg(clk_ticks);
+    diversity_baud_fast = diversity_baud_center +
+        (diversity_baud_center * PS2_UART_DIVERSITY_DELTA_PERCENT / 100);
+    diversity_baud_slow = diversity_baud_center -
+        (diversity_baud_center * PS2_UART_DIVERSITY_DELTA_PERCENT / 100);
+
+    LOG_INF("Diversity: center=0x%08x, fast(+%d%%)=0x%08x, slow(-%d%%)=0x%08x",
+            diversity_baud_center,
+            PS2_UART_DIVERSITY_DELTA_PERCENT, diversity_baud_fast,
+            PS2_UART_DIVERSITY_DELTA_PERCENT, diversity_baud_slow);
+
+    /* Apply fast baud to UARTE0 (primary) */
+    NRF_UARTE0->BAUDRATE = diversity_baud_fast;
+    LOG_INF("Diversity: UARTE0 BAUDRATE set to 0x%08x (fast)", diversity_baud_fast);
+
+    /* Phase 2: Configure UARTE1 (bare-metal, slow baud) */
+    nrf_uarte_enable(NRF_UARTE1);  /* Must enable briefly to reset state */
+    nrf_uarte_disable(NRF_UARTE1);
+
+    /* Pin select: RXD = P0.17 (same as UARTE0), all others disconnected */
+    NRF_UARTE1->PSEL.RXD = 17;                /* P0.17 */
+    NRF_UARTE1->PSEL.TXD = NRF_UARTE_PSEL_DISCONNECTED;
+    NRF_UARTE1->PSEL.CTS = NRF_UARTE_PSEL_DISCONNECTED;
+    NRF_UARTE1->PSEL.RTS = NRF_UARTE_PSEL_DISCONNECTED;
+
+    /* CONFIG: 8 data bits, even parity (0x7 << 1 = 0x0E), no HWFC */
+    NRF_UARTE1->CONFIG = 0x0E;
+
+    /* Baud rate: slow (f - δ) */
+    NRF_UARTE1->BAUDRATE = diversity_baud_slow;
+
+    /* DMA: 1-byte receive buffer */
+    NRF_UARTE1->RXD.PTR = (uint32_t)&uarte1_dma_buf;
+    NRF_UARTE1->RXD.MAXCNT = 1;
+
+    /* Enable UARTE1 */
+    nrf_uarte_enable(NRF_UARTE1);
+
+    /* Clear stale state */
+    NRF_UARTE1->ERRORSRC = 0x0F;  /* W1C all error flags */
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXTO);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXSTARTED);
+
+    /* Enable ENDRX + ERROR interrupts */
+    nrf_uarte_int_enable(NRF_UARTE1,
+                         NRF_UARTE_INT_ENDRX_MASK | NRF_UARTE_INT_ERROR_MASK);
+
+    /* Register bare-metal ISR and enable in NVIC */
+    IRQ_DIRECT_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_UARTE1), 1,
+                       uarte1_diversity_isr, 0);
+    irq_enable(NRFX_IRQ_NUMBER_GET(NRF_UARTE1));
+
+    /* Start receiving */
+    uarte1_byte_ready = false;
+    nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
+
+    uarte1_initialized = true;
+    LOG_INF("Diversity: UARTE1 initialized at 0x%08x (slow), ISR registered",
+            diversity_baud_slow);
+
+    /* Start periodic stats logging */
+    k_work_schedule(&diversity_stats_work,
+                    K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
+
+    return 0;
+}
+
+/**
+ * Stop UARTE1 receiver (called from set_mode_write).
+ */
+static void ps2_uart_diversity_stop_rx(void) {
+    if (!uarte1_initialized) {
+        return;
+    }
+
+    nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STOPRX);
+
+    int timeout_us = 2000;
+    while (!nrf_uarte_event_check(NRF_UARTE1, NRF_UARTE_EVENT_RXTO) &&
+           timeout_us > 0) {
+        k_busy_wait(2);
+        timeout_us -= 2;
+    }
+    if (timeout_us <= 0) {
+        LOG_WRN("Diversity: UARTE1 STOPRX timed out");
+    }
+
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXTO);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXSTARTED);
+    uarte1_byte_ready = false;
+}
+
+/**
+ * Restart UARTE1 receiver (called from set_mode_read).
+ */
+static void ps2_uart_diversity_start_rx(void) {
+    if (!uarte1_initialized) {
+        return;
+    }
+
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
+    NRF_UARTE1->ERRORSRC = 0x0F;
+    uarte1_byte_ready = false;
+    nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
+}
+
+/**
+ * Apply the PS/2 parity trick to raw UARTE ERRORSRC bits.
+ * Returns 0 if byte is good, or a UART_ERROR_* code if corrupted.
+ *
+ * PS/2 uses odd parity but we configure UARTE for even parity, so:
+ *  - PARITY bit SET in ERRORSRC = expected (odd parity detected) = OK
+ *  - PARITY bit CLEAR = actual even parity = real parity error
+ *  - FRAMING/OVERRUN/BREAK = real errors regardless
+ */
+static int ps2_uart_diversity_check_err(uint32_t errorsrc) {
+    if ((errorsrc & NRF_UARTE_ERROR_PARITY_MASK) == 0) {
+        return UART_ERROR_PARITY;
+    } else if (errorsrc & NRF_UARTE_ERROR_OVERRUN_MASK) {
+        return UART_ERROR_OVERRUN;
+    } else if (errorsrc & NRF_UARTE_ERROR_FRAMING_MASK) {
+        return UART_ERROR_FRAMING;
+    } else if (errorsrc & NRF_UARTE_ERROR_BREAK_MASK) {
+        return UART_BREAK;
+    }
+    return 0;  /* No error */
+}
+
+/**
+ * Periodic stats logging work handler.
+ */
+static void diversity_stats_work_handler(struct k_work *work) {
+    if (diversity_byte_count > 0 || diversity_err_uarte1_recovered > 0) {
+        LOG_INF("Diversity stats: total=%u, u0_framing=%u, u0_other=%u, "
+                "u1_recovered=%u, both_failed=%u",
+                diversity_byte_count,
+                diversity_err_uarte0_framing,
+                diversity_err_uarte0_other,
+                diversity_err_uarte1_recovered,
+                diversity_err_both_failed);
+    }
+    k_work_schedule(&diversity_stats_work,
+                    K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
+}
+
+/*
  * PS/2 UART Driver Init
  */
 static int ps2_uart_init_uart(const struct device *dev);
@@ -1631,6 +2021,14 @@ static int ps2_uart_init_uart(const struct device *dev) {
     NRF_UARTE0->BAUDRATE = CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG;
     LOG_INF("Overrode UARTE BAUDRATE register to 0x%08x", CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG);
 #endif
+
+    /* Initialize dual-UARTE diversity receiver.
+     * Calibrates CLK period, sets UARTE0 to f+δ and UARTE1 to f-δ.
+     * On failure, falls through to use the existing baud rate. */
+    err = ps2_uart_diversity_init(dev);
+    if (err != 0) {
+        LOG_WRN("Diversity init failed (%d), running single-UARTE mode", err);
+    }
 
     uart_irq_callback_user_data_set(config->uart_dev, ps2_uart_interrupt_handler,
                                     (void *)data->dev);
