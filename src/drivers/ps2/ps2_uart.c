@@ -1808,7 +1808,11 @@ static int ps2_uart_diversity_init(const struct device *dev) {
 }
 
 /**
- * Stop UARTE1 receiver (called from set_mode_write).
+ * Stop UARTE1 receiver and release the RX pin.
+ *
+ * Called from set_mode_write() and indirectly during idle PM suspend.
+ * Must fully disable UARTE1 and disconnect PSEL.RXD so the pin can be
+ * reclaimed as a GPIO wake interrupt source by the idle PM layer.
  */
 static void ps2_uart_diversity_stop_rx(void) {
     if (!uarte1_initialized) {
@@ -1831,15 +1835,34 @@ static void ps2_uart_diversity_stop_rx(void) {
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXSTARTED);
     uarte1_byte_ready = false;
+
+    /* Fully disable UARTE1 and release the RX pin.
+     * PSEL can only be modified while the peripheral is disabled.
+     * This allows the GPIO subsystem to reclaim P0.17 for the
+     * idle PM wake interrupt (falling-edge detect on DATA). */
+    nrf_uarte_disable(NRF_UARTE1);
+    NRF_UARTE1->PSEL.RXD = NRF_UARTE_PSEL_DISCONNECTED;
 }
 
 /**
- * Restart UARTE1 receiver (called from set_mode_read).
+ * Restart UARTE1 receiver and reclaim the RX pin.
+ *
+ * Called from set_mode_read() after UARTE0 is restarted.
+ * Re-enables UARTE1 with the RX pin reconnected.
  */
 static void ps2_uart_diversity_start_rx(void) {
     if (!uarte1_initialized) {
         return;
     }
+
+    /* Reconnect P0.17 and re-enable UARTE1.
+     * PSEL must be set while disabled (done by stop_rx). */
+    NRF_UARTE1->PSEL.RXD = 17;
+    nrf_uarte_enable(NRF_UARTE1);
+
+    /* Re-arm DMA buffer (PTR/MAXCNT cleared by disable/enable cycle) */
+    NRF_UARTE1->RXD.PTR = (uint32_t)&uarte1_dma_buf;
+    NRF_UARTE1->RXD.MAXCNT = 1;
 
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
