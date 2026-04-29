@@ -1492,6 +1492,14 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
 
     LOG_INF("TP idle PM: entering DORMANT (phase 2: suspend UART)");
 
+    /* Inhibit CLK before any pin transitions.  With CLK held LOW the
+     * TP cannot clock data, so the UART pin disconnection during
+     * suspend won't be interpreted as a host-initiated PS/2 write
+     * that could corrupt TP registers (e.g. config byte 0x2C
+     * controlling InvertX/InvertY/SwapXY orientation bits). */
+    ps2_uart_inhibit_bus(config->ps2_device);
+    k_busy_wait(100); /* PS/2 spec: host must hold CLK LOW ≥100µs */
+
     /* Stop diversity receiver BEFORE suspending UARTE0.
      * UARTE1 must release P0.17 so the GPIO wake interrupt can
      * detect the TP's start-bit falling edge during dormant. */
@@ -1519,6 +1527,13 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
             }
         }
     }
+
+    /* Release CLK so the TP can transmit a start bit to trigger the
+     * wake GPIO interrupt.  If the TP had buffered movement while
+     * CLK was inhibited, it will immediately pull DATA LOW → wake
+     * fires.  The wake handler always runs full recovery so any
+     * bytes lost during this transition are harmless. */
+    ps2_uart_release_bus(config->ps2_device);
 
     data->pm_state = TP_PM_DORMANT;
 }
@@ -1609,43 +1624,45 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* Restart diversity receiver now that UARTE0 is active again. */
     ps2_uart_diversity_start_rx();
 
-    /* 4. Reset packet buffer and self-reset flag to avoid misalignment
-     *    from stale state.  If the TP sent 0xAA just before suspend
-     *    and we never received the 0x00, the flag would stick and
-     *    cause the first real movement byte to be swallowed. */
+    /* 4. Clear stale self-reset flag to avoid misalignment.  If the TP
+     *    sent 0xAA just before suspend and we never received the 0x00,
+     *    the flag would stick and cause the first real movement byte
+     *    to be swallowed. */
     data->tp_self_reset_pending = false;
-    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
-    /* 5. Re-enable the PS/2 callback — no PS/2 commands are sent here.
-     *    The TP was never sent F5 (disable reporting) during dormant
-     *    entry, so it is still in reporting mode.  Sending F4 or any
-     *    PS/2 command during wake risks BLE radio preemption of the
-     *    bit-bang write (BLE is renegotiating connection parameters at
-     *    the same time as wake, triggered by the same keypress).
-     *    Instead, just re-arm the callback and let the liveness
-     *    watchdog (5s) handle recovery if the TP actually self-reset
-     *    during dormant (ESD, power glitch). */
-    ps2_enable_callback(config->ps2_device);
-    data->activity_reporting_on = true;
-
+    /* Transition to ACTIVE before recovery so the watchdog handler
+     * and activity callback see the correct PM state. */
     data->pm_state = TP_PM_ACTIVE;
 
-    /* Restart the liveness watchdog now that the UART is live again.
-     * Use a shorter 3s timeout so the watchdog fires BEFORE the 5s
-     * idle timer.  If the TP self-reset during dormant (reporting
-     * disabled), it won't send bytes.  Without this head start the
-     * idle timer races the watchdog — if the idle timer wins, the
-     * system goes dormant before the watchdog can send F4, and the
-     * TP is stuck in dormant forever (it can't GPIO-wake because
-     * reporting is disabled).
+    /* 5. Full recovery: re-apply all settings + F4.
      *
-     * Set last_byte_time 2s in the past so that after the 3s delay
-     * the watchdog's silence check (>= 5s) passes.  If real TP data
-     * arrives before then, activity_callback updates last_byte_time
-     * and the watchdog reschedules harmlessly. */
-    data->last_byte_time = k_uptime_get() - 2000;
+     *    The UART pin transition during dormant entry can cause the TP
+     *    to misinterpret pin glitches as a host-initiated PS/2 write,
+     *    corrupting registers (especially config byte 0x2C which
+     *    controls InvertX/InvertY/SwapXY orientation bits).  CLK
+     *    inhibition during dormant entry (see dormant_finish_handler)
+     *    prevents this, but we run recovery unconditionally as a
+     *    safety net — it's idempotent (~162ms, batch-protected).
+     *
+     *    Also handles the case where the TP self-reset during dormant
+     *    (ESD, power glitch), which reverts all registers to factory
+     *    defaults and disables reporting.
+     *
+     *    Previously this was deferred to the liveness watchdog, but
+     *    that only fires when the TP is silent.  If the TP is still
+     *    reporting (with corrupted orientation), the watchdog sees
+     *    activity and never triggers recovery. */
+    int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
+    if (ret < 0) {
+        LOG_ERR("TP idle PM: wake recovery F4 failed (%d)", ret);
+    } else if (ret > 0) {
+        LOG_WRN("TP idle PM: wake recovery: %d setting(s) failed", ret);
+    }
+
+    /* 6. Restart the liveness watchdog and idle timer. */
+    data->last_byte_time = k_uptime_get();
     data->liveness_retries = 0;
-    k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(3));
+    k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
 
     /* Restart the idle timer */
     k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,

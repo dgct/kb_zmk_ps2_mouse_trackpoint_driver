@@ -456,6 +456,21 @@ int ps2_uart_set_scl_callback_enabled(const struct device *dev, bool enabled) {
     return err;
 }
 
+/*
+ * Bus inhibit / release — used by idle PM to prevent the TP from
+ * clocking data during UART pin transitions.  Host drives CLK LOW
+ * to inhibit; releases to GPIO input (idle HIGH via external pull-up)
+ * to allow TP transmissions again.
+ */
+void ps2_uart_inhibit_bus(const struct device *dev) {
+    ps2_uart_configure_pin_scl_output(dev);
+    ps2_uart_set_scl(dev, 0);
+}
+
+void ps2_uart_release_bus(const struct device *dev) {
+    ps2_uart_configure_pin_scl_input(dev);
+}
+
 /* Diversity receiver forward declarations */
 static int ps2_uart_diversity_check_err(uint32_t errorsrc);
 void ps2_uart_diversity_stop_rx(void);

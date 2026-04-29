@@ -49,3 +49,20 @@ static inline int ps2_uart_timeslot_batch_begin(void) { return 0; }
 static inline void ps2_uart_timeslot_batch_end(void) { }
 
 #endif /* CONFIG_PS2_UART_TIMESLOT_PROTECTION */
+
+/**
+ * Inhibit the PS/2 bus by driving CLK LOW.  While inhibited the TP
+ * cannot clock data, preventing pin-glitch corruption during UART
+ * pin transitions (idle PM suspend/resume).
+ *
+ * @param dev  The PS/2 UART device (e.g. config->ps2_device).
+ */
+void ps2_uart_inhibit_bus(const struct device *dev);
+
+/**
+ * Release the PS/2 bus (CLK back to input).  The TP can transmit
+ * again once the external pull-up brings CLK HIGH.
+ *
+ * @param dev  The PS/2 UART device (e.g. config->ps2_device).
+ */
+void ps2_uart_release_bus(const struct device *dev);
