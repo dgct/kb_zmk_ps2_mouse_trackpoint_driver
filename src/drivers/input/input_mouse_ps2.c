@@ -1503,46 +1503,24 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     data->tp_self_reset_pending = false;
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
-    /* 5. Re-apply TP settings — extended registers (0xE2) are volatile
-     *    RAM and may be lost if the TP internally reset during UART
-     *    suspend (ESD, watchdog, power glitch on pinctrl transition).
-     *    This is idempotent: if the TP retained its state, re-writing
-     *    the same values is harmless.  Cost: ~30ms of PS/2 traffic.
+    /* 5. Re-enable reporting with a single F4.
+     *    TP settings (extended registers) survive UART suspend because
+     *    only the UART is suspended — the TP stays powered and retains
+     *    all register values in RAM.  Full apply_all_settings is NOT
+     *    needed here; it fires ~49 PS/2 writes, each requiring a
+     *    pinctrl round-trip that can glitch the TP.
      *
-     *    TARE FIX: clear activity_reporting_on BEFORE apply_all_settings
-     *    so it skips the F5→F4 wrapper.  The TP was never sent F5
-     *    during dormant entry, so sending F5 now would cause a baseline
-     *    recalibration (tare) — if the user's finger is on the stick,
-     *    the pressed position becomes the new zero and they must
-     *    release and re-press. */
+     *    Safety net if TP did self-reset during suspend (ESD, etc.):
+     *    - Liveness watchdog stage 1 (F4 probe) fires at 5s
+     *    - Stage 2 (0xFF reset + full apply_all_settings) at ~15s
+     *
+     *    TARE FIX: clear activity_reporting_on BEFORE sending F4
+     *    so the enable path doesn't send an F5→F4 pair.  The TP was
+     *    never sent F5 during dormant entry, so F5 now would cause a
+     *    baseline recalibration (tare). */
     if (data->is_trackpoint) {
         data->activity_reporting_on = false;
 
-        /* Restore sampling rate — if the TP self-reset while the UART
-         * was suspended, it reverted to 100 samples/sec.  Idempotent
-         * if the TP retained its state. */
-        if (data->sampling_rate != MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT) {
-            int rate_err = zmk_mouse_ps2_set_sampling_rate(dev, data->sampling_rate);
-            if (rate_err) {
-                LOG_WRN("TP idle PM: failed to restore sampling rate %d (%d)",
-                        data->sampling_rate, rate_err);
-            }
-        }
-
-        int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
-        if (failures > 0) {
-            LOG_WRN("TP idle PM: %d setting(s) failed to re-apply", failures);
-        } else {
-            LOG_INF("TP idle PM: re-applied TP register settings");
-        }
-
-        /* Reset packet buffer after settings — PS/2 traffic during
-         * register writes may leave partial bytes in the buffer. */
-        zmk_mouse_ps2_activity_reset_packet_buffer(dev);
-
-        /* Safety net: if the TP self-reset during suspend, it reverts
-         * to reporting-disabled.  Force-send F4 to ensure reporting is
-         * on regardless of the cached flag state. */
         err = zmk_mouse_ps2_activity_reporting_enable(dev);
         if (err) {
             LOG_ERR("TP idle PM: failed to re-enable reporting (%d)", err);

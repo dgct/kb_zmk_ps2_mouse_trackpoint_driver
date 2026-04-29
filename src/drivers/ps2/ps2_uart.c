@@ -380,6 +380,13 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
     // Make sure SCL interrupt is disabled
     ps2_uart_set_scl_callback_enabled(dev, false);
 
+    // Re-arm UARTE DMA for receiving the next byte.
+    // STOPRX was issued in set_mode_write() before disconnecting the pin.
+    // PTR/MAXCNT registers survive STOPRX (only cleared by peripheral
+    // disable/enable), so no need to call nrf_uarte_rx_buffer_set().
+    nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_ENDRX);
+    nrf_uarte_task_trigger(NRF_UARTE0, NRF_UARTE_TASK_STARTRX);
+
     // Enable UART interrupt
     uart_irq_rx_enable(config->uart_dev);
 
@@ -390,18 +397,39 @@ static int ps2_uart_set_mode_write(const struct device *dev) {
     const struct ps2_uart_config *config = dev->config;
     int err;
 
-    // Set pincntrl with unused pins so that we can control the pins
-    // through GPIO
+    // Cleanly stop UARTE RX DMA before disconnecting the pin.
+    // Without this, pinctrl_apply_state(SLEEP) can yank the RX pin while
+    // DMA is mid-byte, permanently stalling the UARTE receiver.
+    // Sequence modeled on uarte_pm_suspend() in uart_nrfx_uarte.c.
+    if (nrf_uarte_event_check(NRF_UARTE0, NRF_UARTE_EVENT_RXSTARTED)) {
+        uart_irq_rx_disable(config->uart_dev);
+        nrf_uarte_task_trigger(NRF_UARTE0, NRF_UARTE_TASK_STOPRX);
+
+        // Busy-wait for RXTO (receiver fully stopped). Worst case is
+        // ~760us for one PS/2 byte at 14.4kHz; 2ms gives 3x margin.
+        int timeout_us = 2000;
+        while (!nrf_uarte_event_check(NRF_UARTE0, NRF_UARTE_EVENT_RXTO) &&
+               timeout_us > 0) {
+            k_busy_wait(2);
+            timeout_us -= 2;
+        }
+        if (timeout_us <= 0) {
+            LOG_WRN("STOPRX: timed out waiting for RXTO");
+        }
+
+        nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_RXSTARTED);
+        nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_RXTO);
+        nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_ENDRX);
+    } else {
+        uart_irq_rx_disable(config->uart_dev);
+    }
+
+    // Now safe to disconnect the RX pin — DMA is fully stopped
     err = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_SLEEP);
     if (err < 0) {
         LOG_ERR("Could not switch pinctrl state to OFF: %d", err);
         return err;
     }
-
-    // Disable UART interrupt
-    // Unintuitively, this has to be done AFTER applying the pincntrl state,
-    // otherwise GPIO won't be able to use the data pin
-    uart_irq_rx_disable(config->uart_dev);
 
     // Configure data and clock lines for output
     ps2_uart_set_scl_callback_enabled(dev, false);
