@@ -489,14 +489,26 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
     const struct ps2_uart_config *config = dev->config;
     int err;
 
+    /* Inhibit CLK before reconnecting DATA pin to UART.  The steps
+     * below (pinctrl DEFAULT, diversity_start) change P0.17's
+     * electrical state.  Without CLK inhibit the TP could clock
+     * during these transitions and interpret glitches as a
+     * host-initiated PS/2 write, corrupting registers. */
+    ps2_uart_configure_pin_scl_output(dev);
+    gpio_pin_set_dt(&config->scl_gpio, 0);   /* CLK LOW = inhibit */
+    k_busy_wait(100);  /* PS/2 spec: host must hold CLK LOW ≥100µs */
+
     // Set the SDA pin for the uart device
     err = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_DEFAULT);
     if (err < 0) {
         LOG_ERR("Could not switch pinctrl state to DEFAULT: %d", err);
+        /* Release CLK even on error to avoid bus lockup */
+        ps2_uart_configure_pin_scl_input(dev);
         return err;
     }
 
-    // Make sure SCL interrupt is disabled
+    // Make sure SCL interrupt is disabled (will be re-enabled by
+    // release below when SCL goes back to input mode)
     ps2_uart_set_scl_callback_enabled(dev, false);
 
     // Re-arm UARTE DMA for receiving the next byte.
@@ -519,12 +531,29 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
     // Enable UART interrupt
     uart_irq_rx_enable(config->uart_dev);
 
+    /* Release CLK — UART pins are stable, TP can transmit again. */
+    ps2_uart_configure_pin_scl_input(dev);
+
     return err;
 }
 
 static int ps2_uart_set_mode_write(const struct device *dev) {
     const struct ps2_uart_config *config = dev->config;
     int err;
+
+    /* Inhibit CLK before any DATA pin transitions.  The steps below
+     * (STOPRX, diversity_stop, pinctrl SLEEP, GPIO reconfig) all
+     * change the electrical state of P0.17 (DATA).  Without CLK
+     * inhibit the TP could clock during these transitions and
+     * interpret the glitches as a host-initiated PS/2 write,
+     * corrupting registers (e.g. config byte 0x2C).
+     *
+     * CLK stays inhibited here — write_byte_start() takes over
+     * CLK control for the actual PS/2 host write protocol. */
+    ps2_uart_set_scl_callback_enabled(dev, false);
+    ps2_uart_configure_pin_scl_output(dev);
+    gpio_pin_set_dt(&config->scl_gpio, 0);   /* CLK LOW = inhibit */
+    k_busy_wait(100);  /* PS/2 spec: host must hold CLK LOW ≥100µs */
 
     // Cleanly stop UARTE RX DMA before disconnecting the pin.
     // Without this, pinctrl_apply_state(SLEEP) can yank the RX pin while
@@ -563,9 +592,7 @@ static int ps2_uart_set_mode_write(const struct device *dev) {
         return err;
     }
 
-    // Configure data and clock lines for output
-    ps2_uart_set_scl_callback_enabled(dev, false);
-    ps2_uart_configure_pin_scl_output(dev);
+    // Configure data line for output (CLK already configured above)
     ps2_uart_configure_pin_sda_output(dev);
 
     return err;
@@ -800,17 +827,31 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
     if (err != 0) {
         const char *err_str = ps2_uart_read_get_error_str(err);
 
-        // ACK (0xfa) commonly triggers framing errors due to the baud rate
-        // mismatch between PS/2 (~14,925) and UART (14,400). This is benign.
-        if (byte == 0xfa && err == UART_ERROR_FRAMING) {
-            // Ignore, because it is not a real error and happens frequently
-        } else {
-            // Diversity fallback: try UARTE1's byte if available
-            if (err == UART_ERROR_FRAMING) {
-                diversity_err_uarte0_framing++;
-            } else {
-                diversity_err_uarte0_other++;
-            }
+        /* With δ = 1/21 the two receivers tile the TP clock range
+         * with zero overlap.  Three invariants simplify arbitration:
+         *
+         * 1. Exactly-one decoding: for any in-band TP clock, exactly
+         *    one receiver decodes correctly.  Framing error on UARTE0
+         *    means UARTE1 has the correct decode (and vice versa).
+         *
+         * 2. Framing error = reliable oracle: a framing error on one
+         *    channel guarantees the other decoded correctly.  No
+         *    ambiguous zone exists within the coverage band.
+         *
+         * 3. Data bits are always valid, even at the seam: the stop
+         *    bit (bit 10) drifts at most 0.5 bit periods at δ=1/21,
+         *    but data bits drift less (bit n drifts n·δ/2 periods).
+         *    Bit 8 (parity) drifts ~0.19 periods.  So even when the
+         *    stop bit triggers a framing error, the byte VALUE was
+         *    sampled correctly — only the framing status is unreliable.
+         *
+         * This means the arbitration is a simple mux: if UARTE0 has a
+         * framing error, use UARTE1's byte.  If both have framing
+         * errors (at the exact tiling seam, measure-zero probability),
+         * both decoded the data bits correctly — use either one. */
+
+        if (err == UART_ERROR_FRAMING) {
+            diversity_err_uarte0_framing++;
 
             if (uarte1_byte_ready) {
                 int u1_err = ps2_uart_diversity_check_err(uarte1_last_err);
@@ -818,30 +859,49 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                 uarte1_byte_ready = false;
 
                 if (u1_err == 0) {
-                    // UARTE1 decoded cleanly — use its byte
+                    /* Normal case: UARTE1 decoded cleanly */
                     diversity_err_uarte1_recovered++;
                     LOG_DBG("Diversity: UARTE1 recovered byte 0x%02x "
-                            "(UARTE0 had %s for 0x%02x)",
-                            u1_byte, err_str, byte);
+                            "(UARTE0 had framing for 0x%02x)",
+                            u1_byte, byte);
                     byte = u1_byte;
                     err = 0;
-                    // Fall through to normal processing below
+                } else if (u1_err == UART_ERROR_FRAMING) {
+                    /* Seam case: both got framing errors.  Data bits
+                     * are still valid (invariant #3) — use UARTE0's
+                     * byte value since it was sampled correctly. */
+                    diversity_err_uarte1_recovered++;
+                    LOG_DBG("Diversity: seam — both framing, using "
+                            "UARTE0 data 0x%02x", byte);
+                    err = 0;
                 } else {
-                    // Both UARTEs failed
+                    /* UARTE1 has a non-framing error (parity, overrun).
+                     * This indicates real corruption, not a baud
+                     * mismatch.  Discard the byte. */
                     diversity_err_both_failed++;
-                    LOG_WRN("Diversity: both UARTEs failed for byte "
-                            "(u0=0x%02x %s, u1=0x%02x %s)",
-                            byte, err_str,
-                            u1_byte, ps2_uart_read_get_error_str(u1_err));
+                    LOG_WRN("Diversity: both failed "
+                            "(u0=0x%02x framing, u1=0x%02x %s)",
+                            byte, u1_byte,
+                            ps2_uart_read_get_error_str(u1_err));
                     return;
                 }
             } else {
-                LOG_WRN("UART RX detected error for byte 0x%x: %s (%d)",
-                        byte, err_str, err);
-                // Discard corrupted bytes — don't let them into the packet
-                // assembler, command response queue, or callback path.
-                return;
+                /* UARTE1 not ready — can't arbitrate.  Use UARTE0's
+                 * data value anyway (invariant #3: data bits valid
+                 * even with framing error). */
+                diversity_err_uarte1_recovered++;
+                LOG_DBG("Diversity: UARTE1 not ready, using UARTE0 "
+                        "data 0x%02x despite framing", byte);
+                err = 0;
             }
+        } else {
+            /* Non-framing error on UARTE0 (parity, overrun) — real
+             * corruption, not baud mismatch.  Discard. */
+            diversity_err_uarte0_other++;
+            LOG_WRN("UART RX error for byte 0x%x: %s (%d)",
+                    byte, err_str, err);
+            uarte1_byte_ready = false;
+            return;
         }
     }
 
