@@ -30,8 +30,8 @@
  * driver falls back to UARTE1's byte if it decoded cleanly.
  */
 
-/* δ spread percentage (×100 for integer math: 200 = 2.00%) */
-#define PS2_UART_DIVERSITY_DELTA_PERCENT 2
+/* δ spread in permille (35 = 3.5%) */
+#define PS2_UART_DIVERSITY_DELTA_PERMILLE 35
 
 /* CLK calibration: number of edges to sample and expected tick range */
 #define PS2_UART_CAL_EDGES           16
@@ -1740,14 +1740,16 @@ static int ps2_uart_diversity_init(const struct device *dev) {
     /* Compute center baud and δ-spread registers */
     diversity_baud_center = ps2_uart_ticks_to_baud_reg(clk_ticks);
     diversity_baud_fast = diversity_baud_center +
-        (diversity_baud_center * PS2_UART_DIVERSITY_DELTA_PERCENT / 100);
+        (diversity_baud_center * PS2_UART_DIVERSITY_DELTA_PERMILLE / 1000);
     diversity_baud_slow = diversity_baud_center -
-        (diversity_baud_center * PS2_UART_DIVERSITY_DELTA_PERCENT / 100);
+        (diversity_baud_center * PS2_UART_DIVERSITY_DELTA_PERMILLE / 1000);
 
-    LOG_INF("Diversity: center=0x%08x, fast(+%d%%)=0x%08x, slow(-%d%%)=0x%08x",
+    LOG_INF("Diversity: center=0x%08x, fast(+%d.%d%%)=0x%08x, slow(-%d.%d%%)=0x%08x",
             diversity_baud_center,
-            PS2_UART_DIVERSITY_DELTA_PERCENT, diversity_baud_fast,
-            PS2_UART_DIVERSITY_DELTA_PERCENT, diversity_baud_slow);
+            PS2_UART_DIVERSITY_DELTA_PERMILLE / 10,
+            PS2_UART_DIVERSITY_DELTA_PERMILLE % 10, diversity_baud_fast,
+            PS2_UART_DIVERSITY_DELTA_PERMILLE / 10,
+            PS2_UART_DIVERSITY_DELTA_PERMILLE % 10, diversity_baud_slow);
 
     /* Apply fast baud to UARTE0 (primary) */
     NRF_UARTE0->BAUDRATE = diversity_baud_fast;
