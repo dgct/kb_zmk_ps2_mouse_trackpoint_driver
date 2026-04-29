@@ -1671,10 +1671,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* Restart diversity receiver now that UARTE0 is active again. */
     ps2_uart_diversity_start_rx();
 
-    /* Release CLK — UART pins are stable, TP can transmit again.
-     * Any bytes the TP sends now will be received by the UART but
-     * discarded (callback is still disabled; recover_and_enable
-     * resets the packet buffer and re-enables callback via F4). */
+    /* Release CLK — UART pins are stable, TP can transmit again. */
     ps2_uart_release_bus(config->ps2_device);
 
     /* 4. Clear stale self-reset flag to avoid misalignment.  If the TP
@@ -1687,29 +1684,54 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      * and activity callback see the correct PM state. */
     data->pm_state = TP_PM_ACTIVE;
 
-    /* 5. Full recovery: re-apply all settings + F4.
+    /* 5. Fast-path wake: verify config byte, skip full recovery if OK.
      *
-     *    The UART pin transition during dormant entry can cause the TP
-     *    to misinterpret pin glitches as a host-initiated PS/2 write,
-     *    corrupting registers (especially config byte 0x2C which
-     *    controls InvertX/InvertY/SwapXY orientation bits).  CLK
-     *    inhibition during dormant entry (see dormant_finish_handler)
-     *    prevents this, but we run recovery unconditionally as a
-     *    safety net — it's idempotent (~162ms, batch-protected).
+     *    With the GPIO_OUTPUT_LOW CLK inhibit fix, pin transitions no
+     *    longer produce spurious CLK edges.  The TP's registers should
+     *    survive dormant/wake intact.  Full recovery (~162ms + 300ms
+     *    TARE squelch) is only needed if:
+     *      (a) config byte is corrupted (indicates a bus fault), or
+     *      (b) TP self-reset during dormant (registers reverted).
      *
-     *    Also handles the case where the TP self-reset during dormant
-     *    (ESD, power glitch), which reverts all registers to factory
-     *    defaults and disables reporting.
+     *    Fast path (~1ms): read config byte → matches → re-enable
+     *    callback → done.  No F4 sent → no TARE recalibration → no
+     *    squelch needed → instant responsiveness.
      *
-     *    Previously this was deferred to the liveness watchdog, but
-     *    that only fires when the TP is silent.  If the TP is still
-     *    reporting (with corrupted orientation), the watchdog sees
-     *    activity and never triggers recovery. */
-    int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
-    if (ret < 0) {
-        LOG_ERR("TP idle PM: wake recovery F4 failed (%d)", ret);
-    } else if (ret > 0) {
-        LOG_WRN("TP idle PM: wake recovery: %d setting(s) failed", ret);
+     *    The TP was never sent F5 (disable reporting) during dormant
+     *    entry — it's still in reporting-enabled state.  We just need
+     *    to re-enable the driver-side callback. */
+    {
+        uint8_t readback;
+        int verify_err = zmk_mouse_ps2_tp_get_config_byte(dev, &readback);
+        uint8_t desired = zmk_mouse_ps2_tp_desired_config_byte(config);
+
+        if (verify_err == 0 && readback == desired) {
+            /* Fast path: TP is intact.  Just re-enable the callback
+             * and reset the packet buffer (stale bytes may have been
+             * queued during the transition). */
+            LOG_INF("TP idle PM: fast wake (config byte 0x%02x verified)", readback);
+            zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+            data->activity_reporting_on = true;
+            ps2_enable_callback(config->ps2_device);
+        } else {
+            /* Slow path: config byte mismatch or read failed.
+             * TP may have self-reset or suffered a bus fault.
+             * Full recovery re-applies all registers + F4. */
+            if (verify_err) {
+                LOG_WRN("TP idle PM: config byte read failed (%d), "
+                        "running full recovery", verify_err);
+            } else {
+                LOG_WRN("TP idle PM: config byte mismatch "
+                        "(got 0x%02x, want 0x%02x), "
+                        "running full recovery", readback, desired);
+            }
+            int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
+            if (ret < 0) {
+                LOG_ERR("TP idle PM: wake recovery F4 failed (%d)", ret);
+            } else if (ret > 0) {
+                LOG_WRN("TP idle PM: wake recovery: %d setting(s) failed", ret);
+            }
+        }
     }
 
     /* 6. Restart the liveness watchdog and idle timer. */
