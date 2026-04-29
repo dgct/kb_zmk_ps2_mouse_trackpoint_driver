@@ -309,8 +309,10 @@ static struct k_work_q ps2_uart_work_queue_cb;
 static atomic_t ts_started = ATOMIC_INIT(0);
 static atomic_t ts_blocked = ATOMIC_INIT(0);
 
-// Batch mode: when > 0, write_byte_blocking() skips per-byte
+// Batch refcount: when > 0, write_byte_blocking() skips per-byte
 // timeslot acquire/release and relies on the batch timeslot.
+// Supports nesting — inner batch_begin() increments, inner
+// batch_end() decrements. Timeslot is only released at 0.
 // If the batch timeslot expires mid-batch (ts_started goes to 0),
 // individual writes fall back to per-byte protection.
 static atomic_t ts_batch_active = ATOMIC_INIT(0);
@@ -1057,9 +1059,10 @@ int ps2_uart_timeslot_batch_begin(void)
         return -ENODEV;
     }
 
-    // Guard against nested calls.  If already in a batch, the
-    // existing timeslot is still providing protection.
-    if (atomic_get(&ts_batch_active)) {
+    // Nested call — the outer batch's timeslot is still active.
+    // Just bump the refcount so batch_end() knows not to release yet.
+    if (atomic_get(&ts_batch_active) > 0) {
+        atomic_inc(&ts_batch_active);
         return 0;
     }
 
@@ -1077,7 +1080,7 @@ int ps2_uart_timeslot_batch_begin(void)
 
     for (int i = 0; i < PS2_UART_TIMESLOT_BATCH_MAX_POLL_ITERS; i++) {
         if (atomic_get(&ts_started)) {
-            atomic_set(&ts_batch_active, 1);
+            atomic_set(&ts_batch_active, 1);  // outermost caller sets to 1
             LOG_INF("MPSL batch timeslot acquired (100ms)");
             return 0;
         }
@@ -1094,10 +1097,18 @@ int ps2_uart_timeslot_batch_begin(void)
 
 void ps2_uart_timeslot_batch_end(void)
 {
-    if (!atomic_get(&ts_batch_active)) {
+    atomic_val_t prev = atomic_get(&ts_batch_active);
+    if (prev <= 0) {
         return;
     }
 
+    if (prev > 1) {
+        // Inner (nested) batch_end — decrement but keep timeslot.
+        atomic_dec(&ts_batch_active);
+        return;
+    }
+
+    // Outermost batch_end — release the timeslot.
     atomic_set(&ts_batch_active, 0);
     // Clear ts_started so that any per-byte code that runs later
     // doesn't think a timeslot is still active.  The MPSL TIMER0
@@ -1289,7 +1300,7 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
     // per-byte acquire/release — the batch provides protection.
     // If the batch was requested but the timeslot expired (TIMER0
     // fired, ts_started went to 0), fall back to per-byte acquire.
-    bool in_batch = (atomic_get(&ts_batch_active) && atomic_get(&ts_started));
+    bool in_batch = (atomic_get(&ts_batch_active) > 0 && atomic_get(&ts_started));
     int ts_err = -EBUSY;
 
     if (!in_batch) {

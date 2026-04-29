@@ -27,8 +27,9 @@
  * total time past 100 ms), remaining writes gracefully fall back to
  * per-byte timeslot protection.
  *
- * Nesting is NOT supported — do not call batch_begin() while
- * already in a batch.
+ * Nesting IS supported — inner batch_begin() increments a refcount,
+ * inner batch_end() decrements it.  The timeslot is only released
+ * when the outermost batch_end() is called.
  *
  * @return 0 on success, -EBUSY if the timeslot was blocked,
  *         -ENODEV if no session is open.

@@ -501,21 +501,10 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     // Blind-write the entire config byte (register 0x2C) in one shot.
     // This covers PTS, InvertX, InvertY, SwapXY without a read-modify-write,
     // eliminating the risk of preserving corrupted orientation bits from a
-    // garbled read.
+    // garbled read.  The batch timeslot protects against ZLI corruption.
     {
         uint8_t desired = zmk_mouse_ps2_tp_desired_config_byte(config);
         APPLY_SETTING(zmk_mouse_ps2_tp_set_config_byte_direct(dev, desired));
-
-        // Verify the write took effect (nearly free — reporting already paused)
-        uint8_t readback;
-        int verify_err = zmk_mouse_ps2_tp_get_config_byte(dev, &readback);
-        if (verify_err == 0 && readback != desired) {
-            LOG_WRN("TP config byte mismatch: wrote 0x%02x, read 0x%02x — retrying",
-                    desired, readback);
-            APPLY_SETTING(zmk_mouse_ps2_tp_set_config_byte_direct(dev, desired));
-        } else if (verify_err == 0) {
-            LOG_INF("TP config byte: wrote 0x%02x, verified", desired);
-        }
     }
 
     if (config->tp_press_to_select) {
@@ -712,6 +701,15 @@ static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
     const struct zmk_mouse_ps2_config *config = dev->config;
 
+    /* Acquire a batch timeslot covering ALL recovery writes:
+     * sampling rate + all extended registers + scroll mode.
+     * The inner tp_apply_all_settings() call nests harmlessly. */
+    int batch_err = ps2_uart_timeslot_batch_begin();
+    if (batch_err) {
+        LOG_WRN("TP recovery: batch timeslot unavailable (%d), "
+                "using per-byte protection", batch_err);
+    }
+
     /* Restore sampling rate — after a reset the TP reverts to the PS/2
      * default of 100 samples/sec.  This is a standard PS/2 command
      * (0xF3), not an extended register, so apply_all_settings (which
@@ -738,6 +736,8 @@ static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
                     scroll_err);
         }
     }
+
+    ps2_uart_timeslot_batch_end();
 
     return failures;
 }
@@ -1262,10 +1262,10 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
                          i + 1, cmd_bytes, resp.err);
                 if (i > 0 && cmd[0] == '\xe2') {
                     LOG_WRN("Partial 0xE2 extended command: %d/%d bytes sent. "
-                            "Sleeping 50ms to let TP command parser timeout "
+                            "Sleeping 25ms to let TP command parser timeout "
                             "and discard the partial sequence.",
                             i, cmd_bytes);
-                    k_msleep(50);
+                    k_msleep(25);
                 }
                 break;
             }
@@ -1279,9 +1279,9 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
             snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not send arg (%d)", resp.err);
             if (cmd[0] == '\xe2') {
                 LOG_WRN("0xE2 extended command sent but arg byte failed. "
-                        "Sleeping 50ms to let TP command parser timeout "
+                        "Sleeping 25ms to let TP command parser timeout "
                         "and discard the pending write.");
-                k_msleep(50);
+                k_msleep(25);
             }
         }
     }
@@ -3138,6 +3138,13 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
             data->tp_reach = config->tp_reach;
         }
 
+        /* Acquire a batch timeslot covering apply_all + scroll mode. */
+        int batch_err = ps2_uart_timeslot_batch_begin();
+        if (batch_err) {
+            LOG_WRN("Init: batch timeslot unavailable (%d), "
+                    "using per-byte protection", batch_err);
+        }
+
         int tp_failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
         if (tp_failures > 0) {
             LOG_WRN("Init: %d TP setting(s) failed to apply", tp_failures);
@@ -3148,6 +3155,10 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         LOG_INF("Enabling scroll mode.");
         zmk_mouse_ps2_set_packet_mode(dev, MOUSE_PS2_PACKET_MODE_SCROLL);
     }
+
+    /* End the batch timeslot started above (no-op if not a trackpoint
+     * or if batch_begin failed). */
+    ps2_uart_timeslot_batch_end();
 
     zmk_mouse_ps2_settings_init(dev);
 
