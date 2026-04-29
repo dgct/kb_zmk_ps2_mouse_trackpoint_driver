@@ -688,12 +688,14 @@ void zmk_mouse_ps2_activity_reset_packet_buffer(const struct device *dev) {
  * Covers sampling rate (standard PS/2), Intellimouse scroll mode
  * (magic sequence), and all extended 0xE2 registers.
  *
- * Caller contract:
- *   - data->activity_reporting_on MUST be false before calling.
- *     This prevents send_cmd / apply_all_settings from wrapping
- *     each command with F5 (which would cause a TARE recalibration).
- *   - Caller is responsible for sending F4 (activity_reporting_enable)
- *     and re-enabling the PS/2 callback after this returns.
+ * Self-contained — handles internally:
+ *   1. Clears activity_reporting_on (suppresses F5/F4 chatter in
+ *      send_cmd / apply_all_settings, avoids TARE recalibration).
+ *   2. Resets the packet buffer (stale bytes from self-reset).
+ *   3. Restores sampling rate, all extended registers, scroll mode.
+ *
+ * Does NOT acquire a batch timeslot or re-enable reporting (F4).
+ * Use tp_recover_and_enable() for the full protected transaction.
  *
  * Returns the number of extended-register write failures (0 = success).
  */
@@ -701,14 +703,16 @@ static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
     const struct zmk_mouse_ps2_config *config = dev->config;
 
-    /* Acquire a batch timeslot covering ALL recovery writes:
-     * sampling rate + all extended registers + scroll mode.
-     * The inner tp_apply_all_settings() call nests harmlessly. */
-    int batch_err = ps2_uart_timeslot_batch_begin();
-    if (batch_err) {
-        LOG_WRN("TP recovery: batch timeslot unavailable (%d), "
-                "using per-byte protection", batch_err);
-    }
+    /* Clear the reporting flag before any PS/2 commands.  This
+     * prevents send_cmd and apply_all_settings from wrapping each
+     * command with F5/F4, which would cause a TARE recalibration
+     * if the user's finger is on the stick.  The caller (or
+     * tp_recover_and_enable) is responsible for sending F4 after. */
+    data->activity_reporting_on = false;
+
+    /* Reset packet buffer — a self-reset 0xAA 0x00 sequence or stale
+     * bytes from a bus glitch may have left it in a partial state. */
+    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
     /* Restore sampling rate — after a reset the TP reverts to the PS/2
      * default of 100 samples/sec.  This is a standard PS/2 command
@@ -737,7 +741,70 @@ static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
         }
     }
 
+    return failures;
+}
+
+/*
+ * Full TP recovery transaction: restore all settings + re-enable
+ * reporting.  Single entry point for self-reset recovery, liveness
+ * watchdog, and any future recovery path.
+ *
+ * Owns the batch timeslot lifecycle: acquires a 100 ms MPSL timeslot
+ * before any writes and holds it through the F4 re-enable, so every
+ * byte — including the critical F4 — is shielded from BLE ZLI.
+ *
+ * If all F4 attempts fail, force-enables the PS/2 callback so future
+ * self-resets can still be detected, and the liveness watchdog can
+ * retry on its next firing.
+ *
+ * Returns 0 on full success, negative errno on F4 failure (settings
+ * may still have been applied), or a positive count of setting
+ * failures if F4 succeeded but some registers failed.
+ */
+static int zmk_mouse_ps2_tp_recover_and_enable(const struct device *dev) {
+    const struct zmk_mouse_ps2_config *config = dev->config;
+
+    /* Acquire a batch timeslot covering ALL recovery writes + F4.
+     * The inner tp_apply_all_settings() batch_begin nests harmlessly
+     * (refcount 1→2→1).  Held until after F4 so the most critical
+     * write is also ZLI-proof. */
+    int batch_err = ps2_uart_timeslot_batch_begin();
+    if (batch_err) {
+        LOG_WRN("TP recovery: batch timeslot unavailable (%d), "
+                "using per-byte protection", batch_err);
+    }
+
+    int failures = zmk_mouse_ps2_tp_recover_all(dev);
+
+    /* Re-enable reporting with retry.  After a self-reset the TP
+     * reverts to reporting-disabled, and recover_all cleared
+     * activity_reporting_on.  A single failed F4 would leave the
+     * TP permanently mute. */
+    int err = -EAGAIN;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        err = zmk_mouse_ps2_activity_reporting_enable(dev);
+        if (err == 0) {
+            break;
+        }
+        LOG_WRN("TP recovery: F4 re-enable attempt %d/3 failed (%d)",
+                attempt + 1, err);
+        k_sleep(K_MSEC(100 * (attempt + 1)));
+    }
+    if (err) {
+        LOG_ERR("TP recovery: all F4 re-enable attempts failed (%d)", err);
+        /* Force-enable the callback so we can still detect future
+         * self-resets even if the F4 command failed.  The liveness
+         * watchdog will retry on its next firing. */
+        ps2_enable_callback(config->ps2_device);
+        ps2_uart_timeslot_batch_end();
+        return -EIO;
+    }
+
     ps2_uart_timeslot_batch_end();
+
+    if (failures > 0) {
+        LOG_WRN("TP recovery: completed with %d setting failure(s)", failures);
+    }
 
     return failures;
 }
@@ -762,41 +829,11 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
         return;
     }
 
-    /* Clear the reporting flag early — before any commands that pass
-     * pause_reporting=true to send_cmd.  This prevents send_cmd and
-     * apply_all_settings from wrapping each command with F5 (disable
-     * reporting), which would cause a TARE recalibration if the user's
-     * finger is on the stick.  Matches the wake handler pattern. */
-    data->activity_reporting_on = false;
-
-    /* Reset packet buffer — the self-reset 0xAA 0x00 sequence may have
-     * left the buffer in a partial state. */
-    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
-
-    int failures = zmk_mouse_ps2_tp_recover_all(dev);
-
-    /* Force-enable reporting.  After a self-reset the TP reverts to
-     * reporting-disabled, and we cleared activity_reporting_on above.
-     * activity_reporting_enable() will send F4 and re-enable the PS/2
-     * callback.
-     * Retry with backoff — a single failed 0xF4 write would leave the
-     * TP permanently dead. */
-    int err;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        err = zmk_mouse_ps2_activity_reporting_enable(dev);
-        if (err == 0) {
-            break;
-        }
-        LOG_WRN("TP self-reset recovery: reporting re-enable attempt %d failed: %d",
-                attempt + 1, err);
-        k_sleep(K_MSEC(100 * (attempt + 1)));
-    }
-    if (err) {
-        LOG_ERR("TP self-reset recovery: all reporting re-enable attempts failed (%d)", err);
-    }
-
-    if (failures > 0) {
-        LOG_WRN("TP self-reset recovery: completed with %d setting failure(s)", failures);
+    int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
+    if (ret < 0) {
+        LOG_ERR("TP self-reset recovery: F4 re-enable failed (%d)", ret);
+    } else if (ret > 0) {
+        LOG_WRN("TP self-reset recovery: completed with %d setting failure(s)", ret);
     } else {
         LOG_WRN("TP self-reset recovery: all settings re-applied");
     }
@@ -810,8 +847,9 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
  * silently killed the TP.  Force-resend F4 and re-enable the callback.
  *
  * Escalation ladder:
- *   Attempts 1-3: send F4 (Enable Data Reporting), 5s interval.
- *   Attempt  4+:  send 0xFF (full reset), re-apply all settings via
+ *   Attempt  0:   full recovery (re-apply all settings + F4), 5s interval.
+ *   Attempts 1-2: lightweight F4 probe only, 5s interval.
+ *   Attempt  3+:  send 0xFF (full reset), re-apply all settings via
  *                 the self-reset work handler, 30s interval.
  *
  * Never gives up.  When the TP recovers, activity_callback resets
@@ -857,16 +895,11 @@ static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
         LOG_WRN("TP liveness: first probe — no data for %lld ms, "
                 "doing full settings re-apply + F4", silence);
 
-        data->activity_reporting_on = false;
-        int failures = zmk_mouse_ps2_tp_recover_all(dev);
-        if (failures > 0) {
-            LOG_WRN("TP liveness: %d setting(s) failed during recovery", failures);
-        }
-
-        int err = zmk_mouse_ps2_activity_reporting_enable(dev);
-        if (err) {
-            LOG_ERR("TP liveness: failed to re-enable reporting (%d)", err);
-            ps2_enable_callback(config->ps2_device);
+        int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
+        if (ret < 0) {
+            LOG_ERR("TP liveness: F4 re-enable failed (%d)", ret);
+        } else if (ret > 0) {
+            LOG_WRN("TP liveness: %d setting(s) failed during recovery", ret);
         }
 
         k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
@@ -1301,14 +1334,7 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
     if (pause_reporting == true && prev_activity_reporting_on == true) {
         LOG_DBG("Enabling mouse activity reporting...");
 
-        for (int retry = 0; retry < 3; retry++) {
-            err = zmk_mouse_ps2_activity_reporting_enable(dev);
-            if (err == 0) {
-                break;
-            }
-            LOG_WRN("send_cmd: F4 re-enable attempt %d/3 failed (%d)", retry + 1, err);
-            k_msleep(5);
-        }
+        err = zmk_mouse_ps2_activity_reporting_enable(dev);
         if (err) {
             // Don't overwrite existing error
             if (resp.err == 0) {
@@ -3149,16 +3175,17 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         if (tp_failures > 0) {
             LOG_WRN("Init: %d TP setting(s) failed to apply", tp_failures);
         }
-    }
 
-    if (config->scroll_mode) {
+        if (config->scroll_mode) {
+            LOG_INF("Enabling scroll mode.");
+            zmk_mouse_ps2_set_packet_mode(dev, MOUSE_PS2_PACKET_MODE_SCROLL);
+        }
+
+        ps2_uart_timeslot_batch_end();
+    } else if (config->scroll_mode) {
         LOG_INF("Enabling scroll mode.");
         zmk_mouse_ps2_set_packet_mode(dev, MOUSE_PS2_PACKET_MODE_SCROLL);
     }
-
-    /* End the batch timeslot started above (no-op if not a trackpoint
-     * or if batch_begin failed). */
-    ps2_uart_timeslot_batch_end();
 
     zmk_mouse_ps2_settings_init(dev);
 
