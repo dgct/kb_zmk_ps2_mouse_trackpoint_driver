@@ -749,7 +749,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                 if (u1_err == 0) {
                     // UARTE1 decoded cleanly — use its byte
                     diversity_err_uarte1_recovered++;
-                    LOG_INF("Diversity: UARTE1 recovered byte 0x%02x "
+                    LOG_DBG("Diversity: UARTE1 recovered byte 0x%02x "
                             "(UARTE0 had %s for 0x%02x)",
                             u1_byte, err_str, byte);
                     byte = u1_byte;
