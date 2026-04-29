@@ -788,7 +788,7 @@ static int zmk_mouse_ps2_tp_recover_and_enable(const struct device *dev) {
         }
         LOG_WRN("TP recovery: F4 re-enable attempt %d/3 failed (%d)",
                 attempt + 1, err);
-        k_sleep(K_MSEC(100 * (attempt + 1)));
+        k_msleep(5 * (attempt + 1));
     }
     if (err) {
         LOG_ERR("TP recovery: all F4 re-enable attempts failed (%d)", err);

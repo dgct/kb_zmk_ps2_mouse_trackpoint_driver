@@ -88,7 +88,7 @@ LOG_MODULE_REGISTER(ps2_uart);
  * Settings
  */
 
-#define PS2_UART_WRITE_MAX_RETRY 5
+#define PS2_UART_WRITE_MAX_RETRY 3
 #define PS2_UART_READ_MAX_RETRY 3
 
 #define PS2_UART_DATA_QUEUE_SIZE 100
@@ -180,10 +180,10 @@ LOG_MODULE_REGISTER(ps2_uart);
     (11 * PS2_UART_TIMING_SCL_CYCLE_MAX + 2 * PS2_UART_TIMING_SCL_CYCLE_MAX)
 
 // Timeout for write_byte_await_response()
-// PS/2 spec says that device must respond within 20msec,
-// but real life devices take much longer. Especially if
-// you interrupt existing transmissions.
-#define PS2_UART_TIMEOUT_WRITE_AWAIT_RESPONSE K_MSEC(300)
+// PS/2 spec says device must respond within 20ms.  50ms gives
+// 2.5× margin.  (Was 300ms pre-timeslot, when BLE ISRs could
+// delay UART response processing by tens of ms.)
+#define PS2_UART_TIMEOUT_WRITE_AWAIT_RESPONSE K_MSEC(50)
 
 /*
  * Driver Defines
