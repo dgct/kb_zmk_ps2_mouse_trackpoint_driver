@@ -418,8 +418,8 @@ int ps2_uart_set_scl_callback_enabled(const struct device *dev, bool enabled) {
 
 /* Diversity receiver forward declarations */
 static int ps2_uart_diversity_check_err(uint32_t errorsrc);
-static void ps2_uart_diversity_stop_rx(void);
-static void ps2_uart_diversity_start_rx(void);
+void ps2_uart_diversity_stop_rx(void);
+void ps2_uart_diversity_start_rx(void);
 
 static int ps2_uart_set_mode_read(const struct device *dev) {
     const struct ps2_uart_config *config = dev->config;
@@ -1816,7 +1816,7 @@ static int ps2_uart_diversity_init(const struct device *dev) {
  * Must fully disable UARTE1 and disconnect PSEL.RXD so the pin can be
  * reclaimed as a GPIO wake interrupt source by the idle PM layer.
  */
-static void ps2_uart_diversity_stop_rx(void) {
+void ps2_uart_diversity_stop_rx(void) {
     if (!uarte1_initialized) {
         return;
     }
@@ -1852,7 +1852,7 @@ static void ps2_uart_diversity_stop_rx(void) {
  * Called from set_mode_read() after UARTE0 is restarted.
  * Re-enables UARTE1 with the RX pin reconnected.
  */
-static void ps2_uart_diversity_start_rx(void) {
+void ps2_uart_diversity_start_rx(void) {
     if (!uarte1_initialized) {
         return;
     }

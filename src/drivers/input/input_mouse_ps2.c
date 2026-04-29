@@ -23,6 +23,10 @@
 #include <zephyr/pm/device.h>
 #include <zmk/activity.h>
 #include <zmk/event_manager.h>
+
+/* Diversity receiver lifecycle — defined in ps2_uart.c */
+extern void ps2_uart_diversity_stop_rx(void);
+extern void ps2_uart_diversity_start_rx(void);
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/events/position_state_changed.h>
 
@@ -1420,6 +1424,11 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
 
     LOG_INF("TP idle PM: entering DORMANT (phase 2: suspend UART)");
 
+    /* Stop diversity receiver BEFORE suspending UARTE0.
+     * UARTE1 must release P0.17 so the GPIO wake interrupt can
+     * detect the TP's start-bit falling edge during dormant. */
+    ps2_uart_diversity_stop_rx();
+
     /* 3. Suspend the UART peripheral (applies sleep pinctrl automatically) */
     err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_SUSPEND);
     if (err && err != -EALREADY) {
@@ -1528,6 +1537,9 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    (only ENDRX is preserved).  Without this, framing/parity
      *    errors after wake are silently swallowed. */
     uart_irq_err_enable(data->uart_dev);
+
+    /* Restart diversity receiver now that UARTE0 is active again. */
+    ps2_uart_diversity_start_rx();
 
     /* 4. Reset packet buffer and self-reset flag to avoid misalignment
      *    from stale state.  If the TP sent 0xAA just before suspend
