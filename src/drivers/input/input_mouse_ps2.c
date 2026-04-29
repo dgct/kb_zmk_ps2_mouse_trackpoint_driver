@@ -828,7 +828,35 @@ static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
 
     int attempt = data->liveness_retries++;
 
-    if (attempt < 3) {
+    if (attempt == 0) {
+        /* --- First attempt after wake from dormant (or fresh boot).
+         *
+         * The TP may have self-reset during dormant (ESD, power glitch)
+         * which reverts all registers to factory defaults AND disables
+         * reporting.  We missed the 0xAA 0x00 sequence because the UART
+         * was suspended.
+         *
+         * Do a full recovery: re-apply all settings + F4.  This is
+         * idempotent if the TP didn't self-reset (settings are written
+         * to the same values), costs ~20ms, and fixes the "factory
+         * settings after wake" problem. */
+        LOG_WRN("TP liveness: first probe — no data for %lld ms, "
+                "doing full settings re-apply + F4", silence);
+
+        data->activity_reporting_on = false;
+        int failures = zmk_mouse_ps2_tp_recover_all(dev);
+        if (failures > 0) {
+            LOG_WRN("TP liveness: %d setting(s) failed during recovery", failures);
+        }
+
+        int err = zmk_mouse_ps2_activity_reporting_enable(dev);
+        if (err) {
+            LOG_ERR("TP liveness: failed to re-enable reporting (%d)", err);
+            ps2_enable_callback(config->ps2_device);
+        }
+
+        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
+    } else if (attempt < 3) {
         /* --- Stage 1: lightweight F4 probe --- */
         LOG_WRN("TP liveness: attempt %d/3 — no data for %lld ms, sending F4",
                 attempt + 1, silence);
@@ -1562,10 +1590,22 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
 
     data->pm_state = TP_PM_ACTIVE;
 
-    /* Restart the liveness watchdog now that the UART is live again. */
-    data->last_byte_time = k_uptime_get();
+    /* Restart the liveness watchdog now that the UART is live again.
+     * Use a shorter 3s timeout so the watchdog fires BEFORE the 5s
+     * idle timer.  If the TP self-reset during dormant (reporting
+     * disabled), it won't send bytes.  Without this head start the
+     * idle timer races the watchdog — if the idle timer wins, the
+     * system goes dormant before the watchdog can send F4, and the
+     * TP is stuck in dormant forever (it can't GPIO-wake because
+     * reporting is disabled).
+     *
+     * Set last_byte_time 2s in the past so that after the 3s delay
+     * the watchdog's silence check (>= 5s) passes.  If real TP data
+     * arrives before then, activity_callback updates last_byte_time
+     * and the watchdog reschedules harmlessly. */
+    data->last_byte_time = k_uptime_get() - 2000;
     data->liveness_retries = 0;
-    k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
+    k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(3));
 
     /* Restart the idle timer */
     k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
