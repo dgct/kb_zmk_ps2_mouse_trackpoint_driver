@@ -1711,6 +1711,23 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     {
         bool fast_ok = true;
 
+        /* Suppress F5/F4 wrapping during verify reads.
+         *
+         * activity_reporting_on is still true from before dormant
+         * (we never sent F5).  If we leave it true, send_cmd() wraps
+         * every read with F5 (disable) + F4 (enable).  F4 triggers
+         * a TARE recalibration — with the user's finger on the stick
+         * (they just moved it to wake), TARE sets zero at the current
+         * pressure → teleportation on release.
+         *
+         * By clearing the flag, send_cmd(pause_reporting=true) sees
+         * reporting is "off" and skips the F5/F4 pair.  The TP is
+         * still actually reporting (it was never sent F5), but the
+         * PS/2 half-duplex protocol ensures it won't send movement
+         * while we're sending a command.  After the read completes,
+         * we restore the flag. */
+        data->activity_reporting_on = false;
+
         uint8_t config_readback;
         int config_err = zmk_mouse_ps2_tp_get_config_byte(dev, &config_readback);
         uint8_t desired = zmk_mouse_ps2_tp_desired_config_byte(config);
@@ -1731,9 +1748,10 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         }
 
         if (fast_ok) {
-            /* Fast path: TP is intact.  Just re-enable the callback
+            /* Fast path: TP is intact.  Re-enable the callback
              * and reset the packet buffer (stale bytes may have been
-             * queued during the transition). */
+             * queued during the transition).  Restore the reporting
+             * flag — TP is still reporting (never sent F5). */
             LOG_INF("TP idle PM: fast wake (config=0x%02x, sens=%d verified)",
                     config_readback, sens_readback);
             zmk_mouse_ps2_activity_reset_packet_buffer(dev);
@@ -1742,7 +1760,9 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         } else {
             /* Slow path: register mismatch or read failed.
              * TP may have self-reset or suffered a bus fault.
-             * Full recovery re-applies all registers + F4. */
+             * Full recovery re-applies all registers + F4.
+             * activity_reporting_on is already false — recover_all
+             * expects this (skips F5/F4 per-command wrapping). */
             LOG_WRN("TP idle PM: register verify failed, "
                     "running full recovery");
             int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
