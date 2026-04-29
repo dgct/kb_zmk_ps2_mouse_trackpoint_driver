@@ -1581,6 +1581,14 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     k_work_cancel_delayable(&data->idle_pm_dormant_work);
     k_work_cancel_delayable(&data->idle_pm_dormant_finish_work);
 
+    /* Inhibit CLK before any DATA pin transitions.  The resume
+     * sequence disconnects the wake GPIO, re-enables UARTE0 pinctrl,
+     * and reconnects UARTE1 — each step changes P0.17's electrical
+     * state.  Without CLK inhibit the TP could clock in the glitches
+     * as a host-initiated PS/2 write, corrupting registers. */
+    ps2_uart_inhibit_bus(config->ps2_device);
+    k_busy_wait(100); /* PS/2 spec: host must hold CLK LOW ≥100µs */
+
     /* 1. Disable the wake GPIO interrupt (idempotent — ISR may have
      * already done this) and release the pin so the UART pinctrl can
      * reclaim it on resume. */
@@ -1612,6 +1620,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
             gpio_pin_interrupt_configure_dt(&config->wake_gpio,
                                             GPIO_INT_EDGE_TO_INACTIVE);
         }
+        ps2_uart_release_bus(config->ps2_device);
         return;
     }
 
@@ -1623,6 +1632,12 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
 
     /* Restart diversity receiver now that UARTE0 is active again. */
     ps2_uart_diversity_start_rx();
+
+    /* Release CLK — UART pins are stable, TP can transmit again.
+     * Any bytes the TP sends now will be received by the UART but
+     * discarded (callback is still disabled; recover_and_enable
+     * resets the packet buffer and re-enables callback via F4). */
+    ps2_uart_release_bus(config->ps2_device);
 
     /* 4. Clear stale self-reset flag to avoid misalignment.  If the TP
      *    sent 0xAA just before suspend and we never received the 0x00,
