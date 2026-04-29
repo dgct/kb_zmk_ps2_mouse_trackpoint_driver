@@ -440,6 +440,13 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
     // PTR/MAXCNT registers survive STOPRX (only cleared by peripheral
     // disable/enable), so no need to call nrf_uarte_rx_buffer_set().
     nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_ENDRX);
+
+    // Clear any stale ERRORSRC bits left over from a previous framing
+    // error whose byte was never stored to DMA (so uart_err_check was
+    // never called).  Without this, the next valid byte would inherit
+    // the stale error and be misclassified/dropped.
+    nrf_uarte_errorsrc_get_and_clear(NRF_UARTE0);
+
     nrf_uarte_task_trigger(NRF_UARTE0, NRF_UARTE_TASK_STARTRX);
 
     // Restart diversity receiver
@@ -1175,9 +1182,21 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
 
 #if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
     // Acquire an MPSL timeslot to protect the bit-bang write from
-    // BLE radio ZLI preemption. If acquisition fails, we proceed
-    // with an unprotected write (same as pre-timeslot behavior).
-    int ts_err = ps2_uart_timeslot_acquire();
+    // BLE radio ZLI preemption. If the first attempt is blocked
+    // (BLE radio event in progress, e.g. during connection parameter
+    // renegotiation after wake), retry up to 3 times with a short
+    // sleep to let the radio event finish.  Only proceed unprotected
+    // if all attempts fail.
+    int ts_err = -EBUSY;
+    for (int ts_attempt = 0; ts_attempt < 3; ts_attempt++) {
+        ts_err = ps2_uart_timeslot_acquire();
+        if (ts_err == 0) {
+            break;
+        }
+        if (ts_attempt < 2) {
+            k_msleep(1);
+        }
+    }
 #endif
 
     // LOG_DBG("ps2_uart_write_byte_blocking called with byte=0x%x", byte);

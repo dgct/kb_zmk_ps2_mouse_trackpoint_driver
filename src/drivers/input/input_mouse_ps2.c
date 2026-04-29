@@ -1548,90 +1548,17 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     data->tp_self_reset_pending = false;
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
-    /* 5. TARE FIX: clear activity_reporting_on BEFORE any commands
-     *    so the enable/disable path doesn't send an F5→F4 pair.
-     *    The TP was never sent F5 during dormant entry, so F5 now
-     *    would cause a baseline recalibration (tare). */
-    data->activity_reporting_on = false;
-
-    /* 6. Purge any stale bytes from the UART queues.  The callback
-     *    is already disabled from dormant phase 1; this is idempotent
-     *    but clears data_queue and callback_msgq. */
-    ps2_disable_callback(config->ps2_device);
-
-    /* 7. Probe TP state with PS/2 Status Request (0xE9).
-     *    This is a standard PS/2 command that:
-     *    - Resets the TP command parser (via CLK inhibit during write)
-     *    - Returns 3 bytes: [status_flags, resolution, sample_rate]
-     *    - status_flags bit 5 (Enable): 1 if reporting on, 0 after reset
-     *    - sample_rate: current rate (100 after reset, 200 if retained)
-     *
-     *    If the TP self-reset during suspend (ESD, power glitch),
-     *    Enable=0 and/or sample_rate mismatches → full recovery.
-     *    If TP retained state → just send F4 (fast path). */
-    if (data->is_trackpoint) {
-        bool needs_recovery = false;
-
-        struct zmk_mouse_ps2_send_cmd_resp resp = zmk_mouse_ps2_send_cmd(
-            dev,
-            MOUSE_PS2_CMD_STATUS_REQUEST,
-            sizeof(MOUSE_PS2_CMD_STATUS_REQUEST),
-            NULL,
-            MOUSE_PS2_CMD_STATUS_REQUEST_RESP_LEN,
-            false); /* pause_reporting=false — flag already cleared */
-
-        if (resp.err) {
-            LOG_WRN("TP idle PM: 0xE9 status probe failed (%d: %s), "
-                    "assuming self-reset", resp.err, resp.err_msg);
-            needs_recovery = true;
-        } else {
-            uint8_t status_flags = resp.resp_buffer[0];
-            uint8_t reported_rate = resp.resp_buffer[2];
-            bool enable_bit = (status_flags >> 5) & 1;
-
-            LOG_INF("TP idle PM: 0xE9 status: flags=0x%02x "
-                    "(enable=%d), res=%d, rate=%d",
-                    status_flags, enable_bit,
-                    resp.resp_buffer[1], reported_rate);
-
-            if (!enable_bit || reported_rate != data->sampling_rate) {
-                LOG_WRN("TP idle PM: self-reset detected "
-                        "(enable=%d, rate=%d, expected=%d)",
-                        enable_bit, reported_rate,
-                        data->sampling_rate);
-                needs_recovery = true;
-            }
-        }
-
-        if (needs_recovery) {
-            LOG_INF("TP idle PM: running full recovery");
-
-            int failures = zmk_mouse_ps2_tp_recover_all(dev);
-            if (failures > 0) {
-                LOG_WRN("TP idle PM: recovery had %d setting "
-                        "failure(s)", failures);
-            }
-        } else {
-            LOG_INF("TP idle PM: no self-reset, fast wake");
-        }
-
-        /* Re-enable reporting (F4) and callback — both paths need this.
-         * Retry with backoff so a transient bus error doesn't leave
-         * the TP permanently dead. */
-        for (int attempt = 0; attempt < 3; attempt++) {
-            err = zmk_mouse_ps2_activity_reporting_enable(dev);
-            if (err == 0) {
-                break;
-            }
-            LOG_WRN("TP idle PM: F4 re-enable attempt %d/3 "
-                    "failed (%d)", attempt + 1, err);
-            k_msleep(5);
-        }
-        if (err) {
-            LOG_ERR("TP idle PM: failed to re-enable "
-                    "reporting (%d)", err);
-        }
-    }
+    /* 5. Re-enable the PS/2 callback — no PS/2 commands are sent here.
+     *    The TP was never sent F5 (disable reporting) during dormant
+     *    entry, so it is still in reporting mode.  Sending F4 or any
+     *    PS/2 command during wake risks BLE radio preemption of the
+     *    bit-bang write (BLE is renegotiating connection parameters at
+     *    the same time as wake, triggered by the same keypress).
+     *    Instead, just re-arm the callback and let the liveness
+     *    watchdog (5s) handle recovery if the TP actually self-reset
+     *    during dormant (ESD, power glitch). */
+    ps2_enable_callback(config->ps2_device);
+    data->activity_reporting_on = true;
 
     data->pm_state = TP_PM_ACTIVE;
 
