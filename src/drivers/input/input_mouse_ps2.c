@@ -338,6 +338,13 @@ struct zmk_mouse_ps2_data {
     int64_t tp_self_reset_time;   /* uptime_ms when tp_self_reset_pending was set */
     struct k_work tp_self_reset_work;
 
+    int64_t tare_squelch_until;   /* uptime_ms: suppress movement (not clicks) until this time.
+                                   * F4 triggers a TARE recalibration — if the user's finger
+                                   * is on the stick (e.g. they moved it to wake), the TARE
+                                   * sets the current pressure as zero.  On release the TP
+                                   * reports the offset as a large movement (teleportation).
+                                   * Squelch window lets the user release the stick. */
+
     int64_t last_byte_time;       /* uptime_ms of most recent PS/2 byte from TP */
     int liveness_retries;         /* consecutive watchdog recovery attempts */
     struct k_work_delayable liveness_watchdog;
@@ -762,6 +769,7 @@ static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
  * failures if F4 succeeded but some registers failed.
  */
 static int zmk_mouse_ps2_tp_recover_and_enable(const struct device *dev) {
+    struct zmk_mouse_ps2_data *data = dev->data;
     const struct zmk_mouse_ps2_config *config = dev->config;
 
     /* Acquire a batch timeslot covering ALL recovery writes + F4.
@@ -801,6 +809,15 @@ static int zmk_mouse_ps2_tp_recover_and_enable(const struct device *dev) {
     }
 
     ps2_uart_timeslot_batch_end();
+
+    /* Arm the post-TARE movement squelch.  F4 triggers a TARE
+     * recalibration — if the user's finger is on the stick (e.g.
+     * they moved it to wake from dormant), the TP sets the current
+     * pressure as the zero reference.  On release it reports the
+     * offset as a large movement (teleportation).  Suppress movement
+     * for 300ms to let the user lift their finger.  Clicks still
+     * pass through. */
+    data->tare_squelch_until = k_uptime_get() + 300;
 
     if (failures > 0) {
         LOG_WRN("TP recovery: completed with %d setting failure(s)", failures);
@@ -962,6 +979,27 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
     struct zmk_mouse_ps2_packet packet;
     packet = zmk_mouse_ps2_activity_parse_packet_buffer(packet_mode, packet_state, packet_x,
                                                         packet_y, packet_extra);
+
+    /* Post-TARE movement squelch: suppress movement (but not button
+     * clicks) for a short window after F4.  F4 triggers a TARE
+     * recalibration — if the user was pressing the stick (e.g. to
+     * wake from sleep), the calibration sets zero at the current
+     * pressure.  On release the TP reports the offset as a large
+     * sudden movement (teleportation). */
+    if (data->tare_squelch_until > 0 && k_uptime_get() < data->tare_squelch_until) {
+        /* Still in squelch window — zero out movement but let
+         * buttons through (user might be clicking). */
+        packet.mov_x = 0;
+        packet.mov_y = 0;
+        packet.scroll = 0;
+    } else if (data->tare_squelch_until > 0) {
+        /* Squelch expired — clear the flag and reset prev_packet
+         * so the delta check doesn't see a huge jump from 0,0 to
+         * the first real movement. */
+        data->tare_squelch_until = 0;
+        data->prev_packet.mov_x = 0;
+        data->prev_packet.mov_y = 0;
+    }
 
     int x_delta = abs(data->prev_packet.mov_x - packet.mov_x);
     int y_delta = abs(data->prev_packet.mov_y - packet.mov_y);
