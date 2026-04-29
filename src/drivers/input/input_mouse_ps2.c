@@ -2064,16 +2064,53 @@ int zmk_mouse_ps2_tp_get_config_byte(const struct device* dev, uint8_t *config_b
 }
 
 int zmk_mouse_ps2_tp_set_config_byte_direct(const struct device *dev, uint8_t desired) {
-    struct zmk_mouse_ps2_send_cmd_resp resp = zmk_mouse_ps2_send_cmd(
-        dev,
-        MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE, sizeof(MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE), &desired,
-        MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE_RESP_LEN, true);
-    if (resp.err) {
-        LOG_ERR("Could not write trackpoint config byte 0x%02x", desired);
-        return resp.err;
+    /* Write-then-verify loop for the config byte (register 0x2C).
+     *
+     * This register controls InvertX, InvertY, SwapXY, and PTS —
+     * corruption causes rotation/teleporting that persists until
+     * the register is rewritten.  With the diversity receiver
+     * providing reliable reads (1/21 tiling invariants guarantee
+     * correct decoding), we can verify each write landed correctly
+     * and retry on mismatch.
+     *
+     * The read-back adds ~3 PS/2 byte round-trips (~200µs each)
+     * per attempt, negligible in the context of a batch timeslot. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        struct zmk_mouse_ps2_send_cmd_resp resp = zmk_mouse_ps2_send_cmd(
+            dev,
+            MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE, sizeof(MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE), &desired,
+            MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE_RESP_LEN, true);
+        if (resp.err) {
+            LOG_ERR("Config byte write failed on attempt %d/3 (0x%02x): %d",
+                    attempt + 1, desired, resp.err);
+            continue;
+        }
+
+        /* Read back and verify */
+        uint8_t readback;
+        int read_err = zmk_mouse_ps2_tp_get_config_byte(dev, &readback);
+        if (read_err) {
+            LOG_WRN("Config byte verify read failed on attempt %d/3: %d",
+                    attempt + 1, read_err);
+            continue;
+        }
+
+        if (readback == desired) {
+            if (attempt > 0) {
+                LOG_WRN("Config byte verified on attempt %d/3 "
+                        "(0x%02x)", attempt + 1, desired);
+            }
+            return 0;
+        }
+
+        LOG_WRN("Config byte mismatch on attempt %d/3: "
+                "wrote 0x%02x, read 0x%02x",
+                attempt + 1, desired, readback);
     }
 
-    return 0;
+    LOG_ERR("Config byte verification failed after 3 attempts "
+            "(desired 0x%02x)", desired);
+    return -EIO;
 }
 
 int zmk_mouse_ps2_tp_set_config_option(const struct device *dev,
