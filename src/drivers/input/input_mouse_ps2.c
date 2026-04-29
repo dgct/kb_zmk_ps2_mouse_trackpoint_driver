@@ -66,6 +66,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define MOUSE_PS2_CMD_SET_SAMPLING_RATE_RESP_LEN 0
 #define MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT 100
 
+#define MOUSE_PS2_CMD_STATUS_REQUEST "\xe9"
+#define MOUSE_PS2_CMD_STATUS_REQUEST_RESP_LEN 3
+
 #define MOUSE_PS2_CMD_ENABLE_REPORTING "\xf4"
 #define MOUSE_PS2_CMD_ENABLE_REPORTING_RESP_LEN 0
 
@@ -433,6 +436,7 @@ int zmk_mouse_ps2_tp_invert_y_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_swap_xy_set(const struct device *dev, bool enabled);
 int zmk_mouse_ps2_tp_set_config_byte_direct(const struct device *dev, uint8_t desired);
 int zmk_mouse_ps2_set_sampling_rate(const struct device *dev, uint8_t sampling_rate);
+int zmk_mouse_ps2_set_packet_mode(const struct device *dev, zmk_mouse_ps2_packet_mode mode);
 
 /*
  * Apply all TP register settings from data-> to hardware.
@@ -673,6 +677,54 @@ void zmk_mouse_ps2_activity_reset_packet_buffer(const struct device *dev) {
 }
 
 /*
+ * Restore all TP state after a confirmed or suspected self-reset.
+ * Covers sampling rate (standard PS/2), Intellimouse scroll mode
+ * (magic sequence), and all extended 0xE2 registers.
+ *
+ * Caller contract:
+ *   - data->activity_reporting_on MUST be false before calling.
+ *     This prevents send_cmd / apply_all_settings from wrapping
+ *     each command with F5 (which would cause a TARE recalibration).
+ *   - Caller is responsible for sending F4 (activity_reporting_enable)
+ *     and re-enabling the PS/2 callback after this returns.
+ *
+ * Returns the number of extended-register write failures (0 = success).
+ */
+static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
+    struct zmk_mouse_ps2_data *data = dev->data;
+    const struct zmk_mouse_ps2_config *config = dev->config;
+
+    /* Restore sampling rate — after a reset the TP reverts to the PS/2
+     * default of 100 samples/sec.  This is a standard PS/2 command
+     * (0xF3), not an extended register, so apply_all_settings (which
+     * only handles 0xE2 registers) does not cover it. */
+    if (data->sampling_rate != MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT) {
+        int rate_err = zmk_mouse_ps2_set_sampling_rate(dev, data->sampling_rate);
+        if (rate_err) {
+            LOG_ERR("TP recovery: failed to restore sampling rate %d (%d)",
+                    data->sampling_rate, rate_err);
+        }
+    }
+
+    int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
+
+    /* Restore Intellimouse scroll mode if configured.  After a
+     * self-reset the TP reverts to 3-byte PS/2 default packets.
+     * Without this, the driver expects 4-byte packets but the TP
+     * sends 3-byte, causing persistent packet misalignment. */
+    if (config->scroll_mode) {
+        int scroll_err = zmk_mouse_ps2_set_packet_mode(dev,
+                                                       MOUSE_PS2_PACKET_MODE_SCROLL);
+        if (scroll_err) {
+            LOG_ERR("TP recovery: failed to restore scroll mode (%d)",
+                    scroll_err);
+        }
+    }
+
+    return failures;
+}
+
+/*
  * TP Self-Reset Recovery
  *
  * When a TrackPoint spontaneously resets (ESD, power glitch, internal
@@ -703,19 +755,7 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
      * left the buffer in a partial state. */
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
-    /* Restore sampling rate — after a reset the TP reverts to the PS/2
-     * default of 100 samples/sec.  This is a standard PS/2 command
-     * (0xF3), not an extended register, so apply_all_settings (which
-     * only handles 0xE2 registers) does not cover it. */
-    if (data->sampling_rate != MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT) {
-        int rate_err = zmk_mouse_ps2_set_sampling_rate(dev, data->sampling_rate);
-        if (rate_err) {
-            LOG_ERR("TP self-reset recovery: failed to restore sampling rate %d (%d)",
-                    data->sampling_rate, rate_err);
-        }
-    }
-
-    int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
+    int failures = zmk_mouse_ps2_tp_recover_all(dev);
 
     /* Force-enable reporting.  After a self-reset the TP reverts to
      * reporting-disabled, and we cleared activity_reporting_on above.
@@ -1483,18 +1523,11 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         return;
     }
 
-    /* 3. Re-enable the PS/2 callback (reporting was never disabled,
-     *    so no F4 is needed). */
-    err = ps2_enable_callback(config->ps2_device);
-
-    /* 3b. Restore the UART error interrupt which the Zephyr nRF UARTE
-     *     PM driver does not save/restore across suspend/resume
-     *     (only ENDRX is preserved).  Without this, framing/parity
-     *     errors after wake are silently swallowed. */
+    /* 3. Restore the UART error interrupt which the Zephyr nRF UARTE
+     *    PM driver does not save/restore across suspend/resume
+     *    (only ENDRX is preserved).  Without this, framing/parity
+     *    errors after wake are silently swallowed. */
     uart_irq_err_enable(data->uart_dev);
-    if (err) {
-        LOG_ERR("TP idle PM: ps2_enable_callback failed (%d)", err);
-    }
 
     /* 4. Reset packet buffer and self-reset flag to avoid misalignment
      *    from stale state.  If the TP sent 0xAA just before suspend
@@ -1503,27 +1536,88 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     data->tp_self_reset_pending = false;
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
 
-    /* 5. Re-enable reporting with a single F4.
-     *    TP settings (extended registers) survive UART suspend because
-     *    only the UART is suspended — the TP stays powered and retains
-     *    all register values in RAM.  Full apply_all_settings is NOT
-     *    needed here; it fires ~49 PS/2 writes, each requiring a
-     *    pinctrl round-trip that can glitch the TP.
-     *
-     *    Safety net if TP did self-reset during suspend (ESD, etc.):
-     *    - Liveness watchdog stage 1 (F4 probe) fires at 5s
-     *    - Stage 2 (0xFF reset + full apply_all_settings) at ~15s
-     *
-     *    TARE FIX: clear activity_reporting_on BEFORE sending F4
-     *    so the enable path doesn't send an F5→F4 pair.  The TP was
-     *    never sent F5 during dormant entry, so F5 now would cause a
-     *    baseline recalibration (tare). */
-    if (data->is_trackpoint) {
-        data->activity_reporting_on = false;
+    /* 5. TARE FIX: clear activity_reporting_on BEFORE any commands
+     *    so the enable/disable path doesn't send an F5→F4 pair.
+     *    The TP was never sent F5 during dormant entry, so F5 now
+     *    would cause a baseline recalibration (tare). */
+    data->activity_reporting_on = false;
 
-        err = zmk_mouse_ps2_activity_reporting_enable(dev);
+    /* 6. Purge any stale bytes from the UART queues.  The callback
+     *    is already disabled from dormant phase 1; this is idempotent
+     *    but clears data_queue and callback_msgq. */
+    ps2_disable_callback(config->ps2_device);
+
+    /* 7. Probe TP state with PS/2 Status Request (0xE9).
+     *    This is a standard PS/2 command that:
+     *    - Resets the TP command parser (via CLK inhibit during write)
+     *    - Returns 3 bytes: [status_flags, resolution, sample_rate]
+     *    - status_flags bit 5 (Enable): 1 if reporting on, 0 after reset
+     *    - sample_rate: current rate (100 after reset, 200 if retained)
+     *
+     *    If the TP self-reset during suspend (ESD, power glitch),
+     *    Enable=0 and/or sample_rate mismatches → full recovery.
+     *    If TP retained state → just send F4 (fast path). */
+    if (data->is_trackpoint) {
+        bool needs_recovery = false;
+
+        struct zmk_mouse_ps2_send_cmd_resp resp = zmk_mouse_ps2_send_cmd(
+            dev,
+            MOUSE_PS2_CMD_STATUS_REQUEST,
+            sizeof(MOUSE_PS2_CMD_STATUS_REQUEST),
+            NULL,
+            MOUSE_PS2_CMD_STATUS_REQUEST_RESP_LEN,
+            false); /* pause_reporting=false — flag already cleared */
+
+        if (resp.err) {
+            LOG_WRN("TP idle PM: 0xE9 status probe failed (%d: %s), "
+                    "assuming self-reset", resp.err, resp.err_msg);
+            needs_recovery = true;
+        } else {
+            uint8_t status_flags = resp.resp_buffer[0];
+            uint8_t reported_rate = resp.resp_buffer[2];
+            bool enable_bit = (status_flags >> 5) & 1;
+
+            LOG_INF("TP idle PM: 0xE9 status: flags=0x%02x "
+                    "(enable=%d), res=%d, rate=%d",
+                    status_flags, enable_bit,
+                    resp.resp_buffer[1], reported_rate);
+
+            if (!enable_bit || reported_rate != data->sampling_rate) {
+                LOG_WRN("TP idle PM: self-reset detected "
+                        "(enable=%d, rate=%d, expected=%d)",
+                        enable_bit, reported_rate,
+                        data->sampling_rate);
+                needs_recovery = true;
+            }
+        }
+
+        if (needs_recovery) {
+            LOG_INF("TP idle PM: running full recovery");
+
+            int failures = zmk_mouse_ps2_tp_recover_all(dev);
+            if (failures > 0) {
+                LOG_WRN("TP idle PM: recovery had %d setting "
+                        "failure(s)", failures);
+            }
+        } else {
+            LOG_INF("TP idle PM: no self-reset, fast wake");
+        }
+
+        /* Re-enable reporting (F4) and callback — both paths need this.
+         * Retry with backoff so a transient bus error doesn't leave
+         * the TP permanently dead. */
+        for (int attempt = 0; attempt < 3; attempt++) {
+            err = zmk_mouse_ps2_activity_reporting_enable(dev);
+            if (err == 0) {
+                break;
+            }
+            LOG_WRN("TP idle PM: F4 re-enable attempt %d/3 "
+                    "failed (%d)", attempt + 1, err);
+            k_msleep(5);
+        }
         if (err) {
-            LOG_ERR("TP idle PM: failed to re-enable reporting (%d)", err);
+            LOG_ERR("TP idle PM: failed to re-enable "
+                    "reporting (%d)", err);
         }
     }
 
