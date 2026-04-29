@@ -72,6 +72,7 @@ K_WORK_DELAYABLE_DEFINE(diversity_stats_work, diversity_stats_work_handler);
 #include <mpsl.h>
 #include <hal/nrf_timer.h>
 #include <mpsl_hwres.h>
+#include <ps2_uart_timeslot.h>
 #endif /* IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION) */
 
 #define LOG_LEVEL CONFIG_PS2_LOG_LEVEL
@@ -273,14 +274,25 @@ static struct k_work_q ps2_uart_work_queue_cb;
 
 #if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
 
-// Timeslot length: must cover worst-case PS/2 write time (~5.4ms) with margin.
+// Per-byte timeslot: covers a single PS/2 write (~5.4ms) with margin.
 // TIMER0 fires 500µs before end to cleanly return ACTION_END.
 #define PS2_UART_TIMESLOT_LENGTH_US 8000
 #define PS2_UART_TIMESLOT_TIMER_EXPIRY_US (PS2_UART_TIMESLOT_LENGTH_US - 500)
 
+// Batch timeslot: covers an entire settings batch (~40 writes, ~80ms).
+// Uses the MPSL maximum of 100ms so all register writes are protected
+// by a single timeslot with no inter-write radio gaps.
+#define PS2_UART_TIMESLOT_BATCH_LENGTH_US 100000
+#define PS2_UART_TIMESLOT_BATCH_TIMER_EXPIRY_US \
+    (PS2_UART_TIMESLOT_BATCH_LENGTH_US - 500)
+
 // How long to wait for MPSL to schedule the timeslot before giving up
 // and writing unprotected (2 BLE connection intervals at 7.5ms).
 #define PS2_UART_TIMESLOT_TIMEOUT_US 15000
+
+// Batch timeslot timeout: allow more time — the scheduler may need
+// to wait for a long-enough gap in the radio schedule.
+#define PS2_UART_TIMESLOT_BATCH_TIMEOUT_US 50000
 
 // Polling interval while waiting for timeslot grant
 #define PS2_UART_TIMESLOT_POLL_INTERVAL_US 10
@@ -289,10 +301,26 @@ static struct k_work_q ps2_uart_work_queue_cb;
 #define PS2_UART_TIMESLOT_MAX_POLL_ITERS \
     (PS2_UART_TIMESLOT_TIMEOUT_US / PS2_UART_TIMESLOT_POLL_INTERVAL_US)
 
+#define PS2_UART_TIMESLOT_BATCH_MAX_POLL_ITERS \
+    (PS2_UART_TIMESLOT_BATCH_TIMEOUT_US / PS2_UART_TIMESLOT_POLL_INTERVAL_US)
+
 // Atomic flags for signal handler → thread communication.
 // Signal handler runs at priority 0, cannot use kernel APIs.
 static atomic_t ts_started = ATOMIC_INIT(0);
 static atomic_t ts_blocked = ATOMIC_INIT(0);
+
+// Batch mode: when > 0, write_byte_blocking() skips per-byte
+// timeslot acquire/release and relies on the batch timeslot.
+// If the batch timeslot expires mid-batch (ts_started goes to 0),
+// individual writes fall back to per-byte protection.
+static atomic_t ts_batch_active = ATOMIC_INIT(0);
+
+// The timeslot length granted by MPSL for the current session.
+// Set before each request so the signal handler uses the correct
+// TIMER0 expiry value.  Updated atomically from the thread side
+// before mpsl_timeslot_request() — safe because the signal handler
+// only reads it after SIGNAL_START, which comes after the request.
+static uint32_t ts_current_timer_expiry_us;
 
 static mpsl_timeslot_signal_return_param_t ts_return_param;
 static mpsl_timeslot_session_id_t ts_session_id;
@@ -305,6 +333,16 @@ static mpsl_timeslot_request_t ts_request_earliest = {
         .priority = MPSL_TIMESLOT_PRIORITY_NORMAL,
         .length_us = PS2_UART_TIMESLOT_LENGTH_US,
         .timeout_us = PS2_UART_TIMESLOT_TIMEOUT_US,
+    },
+};
+
+static mpsl_timeslot_request_t ts_request_batch = {
+    .request_type = MPSL_TIMESLOT_REQ_TYPE_EARLIEST,
+    .params.earliest = {
+        .hfclk = MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE,
+        .priority = MPSL_TIMESLOT_PRIORITY_HIGH,
+        .length_us = PS2_UART_TIMESLOT_BATCH_LENGTH_US,
+        .timeout_us = PS2_UART_TIMESLOT_BATCH_TIMEOUT_US,
     },
 };
 
@@ -903,8 +941,10 @@ static mpsl_timeslot_signal_return_param_t *ps2_uart_timeslot_cb(
     case MPSL_TIMESLOT_SIGNAL_START:
         // Timeslot granted. Set up TIMER0 to fire before timeslot ends
         // so we can return ACTION_END cleanly.
+        // Use the expiry value set by the caller before the request —
+        // this is either the per-byte or batch expiry.
         nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0,
-                         PS2_UART_TIMESLOT_TIMER_EXPIRY_US);
+                         ts_current_timer_expiry_us);
         nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
 
         // Signal the polling thread that timeslot is active
@@ -973,6 +1013,10 @@ static int ps2_uart_timeslot_acquire(void)
     atomic_set(&ts_started, 0);
     atomic_set(&ts_blocked, 0);
 
+    // Set the TIMER0 expiry for the per-byte timeslot length
+    // before requesting — the signal handler reads this on START.
+    ts_current_timer_expiry_us = PS2_UART_TIMESLOT_TIMER_EXPIRY_US;
+
     err = mpsl_timeslot_request(ts_session_id, &ts_request_earliest);
     if (err) {
         LOG_WRN("MPSL timeslot request failed: %d", err);
@@ -1001,6 +1045,65 @@ static int ps2_uart_timeslot_acquire(void)
 static void ps2_uart_timeslot_release(void)
 {
     atomic_set(&ts_started, 0);
+}
+
+// --- Batch timeslot API (exposed via ps2_uart_timeslot.h) ---
+
+int ps2_uart_timeslot_batch_begin(void)
+{
+    int err;
+
+    if (!ts_session_open) {
+        return -ENODEV;
+    }
+
+    // Guard against nested calls.  If already in a batch, the
+    // existing timeslot is still providing protection.
+    if (atomic_get(&ts_batch_active)) {
+        return 0;
+    }
+
+    atomic_set(&ts_started, 0);
+    atomic_set(&ts_blocked, 0);
+
+    // Set the TIMER0 expiry for the batch timeslot length.
+    ts_current_timer_expiry_us = PS2_UART_TIMESLOT_BATCH_TIMER_EXPIRY_US;
+
+    err = mpsl_timeslot_request(ts_session_id, &ts_request_batch);
+    if (err) {
+        LOG_WRN("MPSL batch timeslot request failed: %d", err);
+        return -EBUSY;
+    }
+
+    for (int i = 0; i < PS2_UART_TIMESLOT_BATCH_MAX_POLL_ITERS; i++) {
+        if (atomic_get(&ts_started)) {
+            atomic_set(&ts_batch_active, 1);
+            LOG_INF("MPSL batch timeslot acquired (100ms)");
+            return 0;
+        }
+        if (atomic_get(&ts_blocked)) {
+            LOG_WRN("MPSL batch timeslot blocked — writes will use per-byte protection");
+            return -EBUSY;
+        }
+        k_busy_wait(PS2_UART_TIMESLOT_POLL_INTERVAL_US);
+    }
+
+    LOG_WRN("MPSL batch timeslot poll timed out — writes will use per-byte protection");
+    return -ETIMEDOUT;
+}
+
+void ps2_uart_timeslot_batch_end(void)
+{
+    if (!atomic_get(&ts_batch_active)) {
+        return;
+    }
+
+    atomic_set(&ts_batch_active, 0);
+    // Clear ts_started so that any per-byte code that runs later
+    // doesn't think a timeslot is still active.  The MPSL TIMER0
+    // will formally end the timeslot when it fires.
+    atomic_set(&ts_started, 0);
+    LOG_INF("MPSL batch timeslot released");
 }
 
 #endif /* IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION) */
@@ -1181,20 +1284,26 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
     int err;
 
 #if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
-    // Acquire an MPSL timeslot to protect the bit-bang write from
-    // BLE radio ZLI preemption. If the first attempt is blocked
-    // (BLE radio event in progress, e.g. during connection parameter
-    // renegotiation after wake), retry up to 3 times with a short
-    // sleep to let the radio event finish.  Only proceed unprotected
-    // if all attempts fail.
+    // Check whether a batch timeslot is covering this write.
+    // If the batch timeslot is active AND hasn't expired, skip
+    // per-byte acquire/release — the batch provides protection.
+    // If the batch was requested but the timeslot expired (TIMER0
+    // fired, ts_started went to 0), fall back to per-byte acquire.
+    bool in_batch = (atomic_get(&ts_batch_active) && atomic_get(&ts_started));
     int ts_err = -EBUSY;
-    for (int ts_attempt = 0; ts_attempt < 3; ts_attempt++) {
-        ts_err = ps2_uart_timeslot_acquire();
-        if (ts_err == 0) {
-            break;
-        }
-        if (ts_attempt < 2) {
-            k_msleep(1);
+
+    if (!in_batch) {
+        // Per-byte timeslot acquire (original behavior).
+        // Retry up to 3 times with a short sleep to let a BLE
+        // radio event finish.
+        for (int ts_attempt = 0; ts_attempt < 3; ts_attempt++) {
+            ts_err = ps2_uart_timeslot_acquire();
+            if (ts_err == 0) {
+                break;
+            }
+            if (ts_attempt < 2) {
+                k_msleep(1);
+            }
         }
     }
 #endif
@@ -1205,7 +1314,7 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
     if (err) {
         LOG_ERR("Could not initiate writing of byte.");
 #if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
-        if (ts_err == 0) {
+        if (!in_batch && ts_err == 0) {
             ps2_uart_timeslot_release();
         }
 #endif
@@ -1238,7 +1347,7 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
         data->cur_write_status = PS2_UART_WRITE_STATUS_INACTIVE;
 
 #if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
-        if (ts_err == 0) {
+        if (!in_batch && ts_err == 0) {
             ps2_uart_timeslot_release();
         }
 #endif
@@ -1246,7 +1355,7 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
     }
 
 #if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
-    if (ts_err == 0) {
+    if (!in_batch && ts_err == 0) {
         ps2_uart_timeslot_release();
     }
 #endif

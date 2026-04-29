@@ -18,6 +18,8 @@
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
 
+#include <ps2_uart_timeslot.h>
+
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
 #include <zephyr/drivers/uart.h>
 #include <zephyr/pm/device.h>
@@ -458,6 +460,15 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     int failures = 0;
     int total = 0;
 
+    /* Acquire a batch MPSL timeslot (100ms) to protect all register
+     * writes from BLE radio ZLI preemption.  If this fails, writes
+     * fall back to per-byte timeslot protection (existing behavior). */
+    int batch_err = ps2_uart_timeslot_batch_begin();
+    if (batch_err) {
+        LOG_WRN("TP settings: batch timeslot unavailable (%d), "
+                "using per-byte protection", batch_err);
+    }
+
     /* If reporting is on, disable it once for the whole batch.
      * The _set() functions pass pause_reporting=true to send_cmd(),
      * but send_cmd() only actually sends F5/F4 when
@@ -526,6 +537,9 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     } else {
         LOG_INF("TP settings: all %d applied successfully", total);
     }
+
+    /* Release the batch timeslot.  No-op if batch_begin failed. */
+    ps2_uart_timeslot_batch_end();
 
     return failures;
 }
