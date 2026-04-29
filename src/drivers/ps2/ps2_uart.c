@@ -470,10 +470,19 @@ int ps2_uart_set_scl_callback_enabled(const struct device *dev, bool enabled) {
  * clocking data during UART pin transitions.  Host drives CLK LOW
  * to inhibit; releases to GPIO input (idle HIGH via external pull-up)
  * to allow TP transmissions again.
+ *
+ * CRITICAL: Configure as GPIO_OUTPUT_LOW, not GPIO_OUTPUT_HIGH.
+ * If the TP is mid-clock and driving CLK LOW (open-drain) when we
+ * switch to OUTPUT_HIGH (push-pull), the nRF overcomes the TP and
+ * forces a LOW→HIGH→LOW glitch — a complete spurious CLK cycle.
+ * The TP latches whatever DATA is at that moment, potentially
+ * accumulating bits of a ghost PS/2 write command across multiple
+ * inhibit/release cycles.  GPIO_OUTPUT_LOW enables the output
+ * driver already driving LOW, matching the TP's driven state — no
+ * glitch, no spurious edge.
  */
 void ps2_uart_inhibit_bus(const struct device *dev) {
-    ps2_uart_configure_pin_scl_output(dev);
-    ps2_uart_set_scl(dev, 0);
+    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW, "output-low (inhibit)");
 }
 
 void ps2_uart_release_bus(const struct device *dev) {
@@ -489,13 +498,15 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
     const struct ps2_uart_config *config = dev->config;
     int err;
 
-    /* Inhibit CLK before reconnecting DATA pin to UART.  The steps
-     * below (pinctrl DEFAULT, diversity_start) change P0.17's
+    /* Inhibit CLK before any DATA pin transitions.  The steps below
+     * (pinctrl DEFAULT, diversity_start) change P0.17's
      * electrical state.  Without CLK inhibit the TP could clock
      * during these transitions and interpret glitches as a
-     * host-initiated PS/2 write, corrupting registers. */
-    ps2_uart_configure_pin_scl_output(dev);
-    gpio_pin_set_dt(&config->scl_gpio, 0);   /* CLK LOW = inhibit */
+     * host-initiated PS/2 write, corrupting registers.
+     *
+     * Use GPIO_OUTPUT_LOW to avoid a HIGH→LOW glitch that would
+     * create a spurious CLK cycle (see inhibit_bus comment). */
+    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW, "output-low (inhibit)");
     k_busy_wait(100);  /* PS/2 spec: host must hold CLK LOW ≥100µs */
 
     // Set the SDA pin for the uart device
@@ -549,10 +560,12 @@ static int ps2_uart_set_mode_write(const struct device *dev) {
      * corrupting registers (e.g. config byte 0x2C).
      *
      * CLK stays inhibited here — write_byte_start() takes over
-     * CLK control for the actual PS/2 host write protocol. */
+     * CLK control for the actual PS/2 host write protocol.
+     *
+     * Use GPIO_OUTPUT_LOW to avoid a HIGH→LOW glitch that would
+     * create a spurious CLK cycle (see inhibit_bus comment). */
     ps2_uart_set_scl_callback_enabled(dev, false);
-    ps2_uart_configure_pin_scl_output(dev);
-    gpio_pin_set_dt(&config->scl_gpio, 0);   /* CLK LOW = inhibit */
+    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW, "output-low (inhibit)");
     k_busy_wait(100);  /* PS/2 spec: host must hold CLK LOW ≥100µs */
 
     // Cleanly stop UARTE RX DMA before disconnecting the pin.
