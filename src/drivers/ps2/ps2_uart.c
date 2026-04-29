@@ -416,6 +416,11 @@ int ps2_uart_set_scl_callback_enabled(const struct device *dev, bool enabled) {
     return err;
 }
 
+/* Diversity receiver forward declarations */
+static int ps2_uart_diversity_check_err(uint32_t errorsrc);
+static void ps2_uart_diversity_stop_rx(void);
+static void ps2_uart_diversity_start_rx(void);
+
 static int ps2_uart_set_mode_read(const struct device *dev) {
     const struct ps2_uart_config *config = dev->config;
     int err;
@@ -656,11 +661,6 @@ void ps2_uart_read_interrupt_handler(const struct device *uart_dev, void *user_d
 static int ps2_uart_read_err_check(const struct device *dev);
 void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte);
 const char *ps2_uart_read_get_error_str(int err);
-
-/* Diversity receiver forward declarations */
-static int ps2_uart_diversity_check_err(uint32_t errorsrc);
-static void ps2_uart_diversity_stop_rx(void);
-static void ps2_uart_diversity_start_rx(void);
 
 static void ps2_uart_interrupt_handler(const struct device *uart_dev, void *user_data) {
     // const struct device* dev = (const struct device*)user_data;
