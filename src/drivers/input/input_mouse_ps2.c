@@ -1592,46 +1592,44 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      * and activity callback see the correct PM state. */
     data->pm_state = TP_PM_ACTIVE;
 
-    /* 4.5. Flush buffered TP movement data.
+    /* 4.5. Silence the TP before any register writes.
      *
      *    The TP was never sent F5 (disable) before dormant — it's
      *    been accumulating movement data from noise/drift.  When CLK
      *    goes HIGH, the TP immediately starts clocking out those
-     *    buffered bytes.  We need to drain them before issuing any
-     *    PS/2 commands.
+     *    buffered bytes.
      *
-     *    Release CLK briefly to let the TP drain its buffer,
-     *    then re-inhibit, purge the data queue. */
+     *    Strategy: release CLK, immediately send F5 to silence the TP,
+     *    then do a short drain to catch any bytes that were in-flight
+     *    before F5 took effect.
+     *
+     *    The F5 write itself inhibits CLK as part of PS/2 host-to-device
+     *    protocol, which aborts any in-progress device-to-host transfer.
+     *    After ACK, the TP stops streaming.  The bus is quiet for the
+     *    subsequent register writes. */
     ps2_uart_release_bus(config->ps2_device);
-    k_msleep(50);
-    ps2_uart_inhibit_bus(config->ps2_device);
+
+    int f5_err = ps2_write(config->ps2_device,
+                           MOUSE_PS2_CMD_DISABLE_REPORTING[0]);
+    if (f5_err) {
+        LOG_WRN("TP idle PM: F5 failed (%d), flushing 50ms instead", f5_err);
+        /* F5 failed — fall back to the old flush strategy. */
+        k_msleep(50);
+    } else {
+        /* F5 succeeded — short drain for any in-flight bytes. */
+        k_msleep(5);
+    }
     ps2_uart_data_queue_empty(config->ps2_device);
 
     /* 5. Unconditionally re-apply all TP settings and re-enable
      *    reporting.
      *
-     *    Previous approach tried to verify registers first (read config
-     *    byte + sensitivity) and skip recovery if they matched.  This
-     *    failed because register reads are unreliable after wake —
-     *    residual movement data (even after the 50ms flush) interleaves
-     *    with read responses, producing garbage values.  The TP keeps
-     *    generating movement data from drift/noise and clocks it out
-     *    the instant CLK goes HIGH for any PS/2 transaction.
-     *
-     *    Writes are inherently more tolerant: the host drives the bus
-     *    (CLK+DATA) during writes, so movement data can't interleave.
-     *    The TP ACKs or NACKs and we retry on failure.
-     *
      *    Since TP registers survive dormant, most writes are idempotent
-     *    (writing the same value the TP already has).  The ~50ms cost
-     *    of unconditional apply is acceptable vs the 462ms full
-     *    recovery, and far more reliable than verify-then-recover. */
+     *    (writing the same value the TP already has).  The bus is now
+     *    quiet (F5 silenced the TP), so writes should succeed without
+     *    contention from movement data. */
 
-    /* Release CLK so PS/2 commands can flow. */
-    ps2_uart_release_bus(config->ps2_device);
-
-    /* Disable reporting before we start writing registers.
-     * activity_reporting_on flag is set false so send_cmd() skips
+    /* Disable reporting flag so send_cmd() skips
      * individual F5/F4 wrapping around each register write. */
     data->activity_reporting_on = false;
 
