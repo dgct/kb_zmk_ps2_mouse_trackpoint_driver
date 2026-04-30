@@ -493,31 +493,68 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
         }
     }
 
+    /* Only write registers whose desired value differs from the TP's
+     * factory default.  After a self-reset the TP reverts to these
+     * defaults, so unchanged registers don't need a bus transaction.
+     * This cuts the batch from ~46 bytes (~92ms) to typically ~20
+     * bytes (~40ms), keeping the batch well within the 100ms MPSL
+     * timeslot for most users.  On-demand timeslot extension
+     * (in ps2_uart.c) provides a safety net if the batch overruns. */
 #define APPLY_SETTING(call) do { total++; if ((call) != 0) { failures++; } } while (0)
+#define APPLY_SETTING_IF_CHANGED(call, val, factory_default) do {         \
+        if ((uint8_t)(val) != (uint8_t)(factory_default)) {               \
+            APPLY_SETTING(call);                                          \
+        } else {                                                          \
+            skipped++;                                                    \
+        }                                                                 \
+    } while (0)
 
-    APPLY_SETTING(zmk_mouse_ps2_tp_sensitivity_set(dev, data->tp_sensitivity));
-    APPLY_SETTING(zmk_mouse_ps2_tp_neg_inertia_set(dev, data->tp_neg_inertia));
-    APPLY_SETTING(zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, data->tp_value6));
-    APPLY_SETTING(zmk_mouse_ps2_tp_up_thresh_set(dev, data->tp_up_thresh));
-    APPLY_SETTING(zmk_mouse_ps2_tp_z_time_set(dev, data->tp_z_time));
-    APPLY_SETTING(zmk_mouse_ps2_tp_jenks_curv_set(dev, data->tp_jenks_curv));
-    APPLY_SETTING(zmk_mouse_ps2_tp_drag_hysteresis_set(dev, data->tp_drag_hysteresis));
-    APPLY_SETTING(zmk_mouse_ps2_tp_min_drag_set(dev, data->tp_min_drag));
-    APPLY_SETTING(zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach));
+    int skipped = 0;
 
-    // Blind-write the entire config byte (register 0x2C) in one shot.
-    // This covers PTS, InvertX, InvertY, SwapXY without a read-modify-write,
-    // eliminating the risk of preserving corrupted orientation bits from a
-    // garbled read.  The batch timeslot protects against ZLI corruption.
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_sensitivity_set(dev, data->tp_sensitivity),
+        data->tp_sensitivity, MOUSE_PS2_CMD_TP_SET_SENSITIVITY_DEFAULT);
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_neg_inertia_set(dev, data->tp_neg_inertia),
+        data->tp_neg_inertia, MOUSE_PS2_CMD_TP_SET_NEG_INERTIA_DEFAULT);
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(dev, data->tp_value6),
+        data->tp_value6, MOUSE_PS2_CMD_TP_SET_VALUE6_UPPER_PLATEAU_SPEED_DEFAULT);
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_up_thresh_set(dev, data->tp_up_thresh),
+        data->tp_up_thresh, MOUSE_PS2_CMD_TP_SET_UP_THRESH_DEFAULT);
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_z_time_set(dev, data->tp_z_time),
+        data->tp_z_time, MOUSE_PS2_CMD_TP_SET_Z_TIME_DEFAULT);
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_jenks_curv_set(dev, data->tp_jenks_curv),
+        data->tp_jenks_curv, MOUSE_PS2_CMD_TP_SET_JENKS_CURV_DEFAULT);
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_drag_hysteresis_set(dev, data->tp_drag_hysteresis),
+        data->tp_drag_hysteresis, MOUSE_PS2_CMD_TP_SET_DRAG_HYSTERESIS_DEFAULT);
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_min_drag_set(dev, data->tp_min_drag),
+        data->tp_min_drag, MOUSE_PS2_CMD_TP_SET_MIN_DRAG_DEFAULT);
+    APPLY_SETTING_IF_CHANGED(
+        zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach),
+        data->tp_reach, MOUSE_PS2_CMD_TP_SET_REACH_DEFAULT);
+
+    // Always write the config byte — it controls orientation bits
+    // (InvertX/Y, SwapXY) and PTS, which are the most critical
+    // registers to get right.  The verify-after-write inside
+    // set_config_byte_direct catches corruption.
     {
         uint8_t desired = zmk_mouse_ps2_tp_desired_config_byte(config);
         APPLY_SETTING(zmk_mouse_ps2_tp_set_config_byte_direct(dev, desired));
     }
 
     if (config->tp_press_to_select) {
-        APPLY_SETTING(zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold));
+        APPLY_SETTING_IF_CHANGED(
+            zmk_mouse_ps2_tp_pts_threshold_set(dev, data->tp_pts_threshold),
+            data->tp_pts_threshold, MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_DEFAULT);
     }
 
+#undef APPLY_SETTING_IF_CHANGED
 #undef APPLY_SETTING
 
     /* Re-enable reporting if we disabled it at the top. */
@@ -529,9 +566,11 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     }
 
     if (failures > 0) {
-        LOG_ERR("TP settings: %d/%d failed to apply", failures, total);
+        LOG_ERR("TP settings: %d/%d failed to apply (%d skipped as factory default)",
+                failures, total, skipped);
     } else {
-        LOG_INF("TP settings: all %d applied successfully", total);
+        LOG_INF("TP settings: %d applied, %d skipped (factory default)",
+                total, skipped);
     }
 
     /* Release the batch timeslot.  No-op if batch_begin failed. */
@@ -873,9 +912,6 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
  * retries to 0 and the watchdog returns to the normal 5s cadence.
  */
 static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
-    /* XXX: disabled for testing — isolate watchdog as rotation source */
-    return;
-
     struct k_work_delayable *dwork = (struct k_work_delayable *)work;
     struct zmk_mouse_ps2_data *data = CONTAINER_OF(dwork, struct zmk_mouse_ps2_data,
                                                    liveness_watchdog);

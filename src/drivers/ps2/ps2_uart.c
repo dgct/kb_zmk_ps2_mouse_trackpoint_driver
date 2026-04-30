@@ -1053,10 +1053,38 @@ static mpsl_timeslot_signal_return_param_t *ps2_uart_timeslot_cb(
         return &ts_return_param;
 
     case MPSL_TIMESLOT_SIGNAL_TIMER0:
-        // Timer expired — end the timeslot cleanly
+        // Timer expired — end the timeslot or extend if batch is active.
         nrf_timer_int_disable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
         nrf_timer_event_clear(MPSL_TIMER0, NRF_TIMER_EVENT_COMPARE0);
 
+        if (atomic_get(&ts_batch_active) > 0) {
+            // Batch still running — request extension instead of ending.
+            // MPSL grants extension only if no BLE activity is scheduled.
+            ts_return_param.callback_action =
+                MPSL_TIMESLOT_SIGNAL_ACTION_EXTEND;
+            ts_return_param.params.extend.length_us =
+                PS2_UART_TIMESLOT_BATCH_LENGTH_US;
+            return &ts_return_param;
+        }
+
+        atomic_set(&ts_started, 0);
+
+        ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_END;
+        return &ts_return_param;
+
+    case MPSL_TIMESLOT_SIGNAL_EXTEND_SUCCEEDED:
+        // Extension granted — reset TIMER0 for the new window.
+        nrf_timer_task_trigger(MPSL_TIMER0, NRF_TIMER_TASK_CLEAR);
+        nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0,
+                         PS2_UART_TIMESLOT_BATCH_TIMER_EXPIRY_US);
+        nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
+
+        ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_NONE;
+        return &ts_return_param;
+
+    case MPSL_TIMESLOT_SIGNAL_EXTEND_FAILED:
+        // BLE needs the radio — end timeslot now.
+        // Remaining writes will fall back to per-byte protection.
         atomic_set(&ts_started, 0);
 
         ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_END;
