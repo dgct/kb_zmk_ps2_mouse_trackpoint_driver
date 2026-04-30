@@ -301,6 +301,9 @@ struct zmk_mouse_ps2_data {
     uint8_t packet_buffer[4];
     int packet_idx;
     struct zmk_mouse_ps2_packet prev_packet;
+    int64_t last_packet_time;       /* uptime of last completed packet;
+                                     * distinguishes 0xAA state bytes from
+                                     * BAT-pass during active streaming */
     struct k_work_delayable packet_buffer_timeout;
 #if IS_ENABLED(CONFIG_SETTINGS)
     struct k_work_delayable zmk_mouse_ps2_save_work;
@@ -331,6 +334,8 @@ struct zmk_mouse_ps2_data {
     bool tp_self_reset_pending;  /* true after receiving 0xAA, awaiting 0x00 device ID */
     int64_t tp_self_reset_time;   /* uptime_ms when tp_self_reset_pending was set */
     struct k_work tp_self_reset_work;
+    uint8_t recovery_fail_count; /* consecutive tp_recover_and_enable failures;
+                                  * caps recovery livelock at 5 attempts */
 
     int tare_squelch_packets;    /* Drop this many movement packets after F4.
                                    * F4 triggers a TARE recalibration — if the user's finger
@@ -622,12 +627,23 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
         }
 
         if (byte == MOUSE_PS2_RESP_SELF_TEST_PASS) {
-            LOG_WRN("TP sent 0xAA (BAT pass) — possible self-reset. "
-                    "Waiting for device ID byte.");
-            data->tp_self_reset_pending = true;
-            data->tp_self_reset_time = k_uptime_get();
-            zmk_mouse_ps2_activity_reset_packet_buffer(data->dev);
-            return;
+            /* A real BAT-pass follows a full TP reset cycle (300-500ms).
+             * During active streaming at 200Hz, inter-packet gap is ~5ms.
+             * If we completed a packet recently, this 0xAA is almost
+             * certainly a movement state byte (overflow_y + sign_y +
+             * right_btn), not a BAT pass. */
+            int64_t since_last = k_uptime_get() - data->last_packet_time;
+            if (since_last < 100) {
+                LOG_DBG("0xAA at packet_idx=0 but last packet %lld ms ago "
+                        "— treating as movement", since_last);
+            } else {
+                LOG_WRN("TP sent 0xAA (BAT pass) — possible self-reset. "
+                        "Waiting for device ID byte.");
+                data->tp_self_reset_pending = true;
+                data->tp_self_reset_time = k_uptime_get();
+                zmk_mouse_ps2_activity_reset_packet_buffer(data->dev);
+                return;
+            }
         }
 
         // Bit 3 of the first command byte should always be 1
@@ -645,6 +661,7 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
     } else if ((data->packet_mode == MOUSE_PS2_PACKET_MODE_PS2_DEFAULT && data->packet_idx == 2) ||
                (data->packet_mode == MOUSE_PS2_PACKET_MODE_SCROLL && data->packet_idx == 3)) {
 
+        data->last_packet_time = k_uptime_get();
         zmk_mouse_ps2_activity_process_cmd(data->dev,
                                            data->packet_mode, data->packet_buffer[0],
                                            data->packet_buffer[1], data->packet_buffer[2],
@@ -897,10 +914,14 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
 
     int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
     if (ret < 0) {
-        LOG_ERR("TP self-reset recovery: F4 re-enable failed (%d)", ret);
+        data->recovery_fail_count++;
+        LOG_ERR("TP self-reset recovery: F4 re-enable failed (%d), "
+                "attempt %d", ret, data->recovery_fail_count);
     } else if (ret > 0) {
+        data->recovery_fail_count = 0;
         LOG_WRN("TP self-reset recovery: completed with %d setting failure(s)", ret);
     } else {
+        data->recovery_fail_count = 0;
         LOG_WRN("TP self-reset recovery: all settings re-applied");
     }
 
@@ -1473,6 +1494,12 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
      * unless F4 re-enables reporting.  Instead of freezing, escalate
      * to full recovery (F5 + re-apply all settings + F4). */
     if (!data->activity_reporting_on) {
+        if (data->recovery_fail_count >= 5) {
+            LOG_ERR("TP idle PM: reporting off, recovery exhausted "
+                    "(%d consecutive failures). Manual reset required.",
+                    data->recovery_fail_count);
+            return;
+        }
         LOG_WRN("TP idle PM: reporting off, scheduling full recovery "
                 "instead of dormant");
         k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
@@ -1530,7 +1557,8 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
      *    detect the TP's start-bit falling edge during dormant. */
     err = ps2_uart_pm_suspend(config->ps2_device, data->uart_dev);
     if (err) {
-        LOG_WRN("TP idle PM: UART suspend failed (%d)", err);
+        LOG_ERR("TP idle PM: UART suspend failed (%d), aborting dormant", err);
+        goto abort_dormant;
     }
 
     /* 4. Reclaim the data pin as a GPIO input with falling-edge interrupt.
@@ -1540,13 +1568,16 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
     if (config->has_wake_gpio) {
         err = gpio_pin_configure_dt(&config->wake_gpio, GPIO_INPUT);
         if (err) {
-            LOG_WRN("TP idle PM: wake GPIO configure failed (%d)", err);
-        } else {
-            err = gpio_pin_interrupt_configure_dt(&config->wake_gpio,
-                                                  GPIO_INT_EDGE_TO_INACTIVE);
-            if (err) {
-                LOG_WRN("TP idle PM: wake GPIO interrupt failed (%d)", err);
-            }
+            LOG_ERR("TP idle PM: wake GPIO configure failed (%d), "
+                    "aborting dormant", err);
+            goto abort_dormant_resume;
+        }
+        err = gpio_pin_interrupt_configure_dt(&config->wake_gpio,
+                                              GPIO_INT_EDGE_TO_INACTIVE);
+        if (err) {
+            LOG_ERR("TP idle PM: wake GPIO interrupt failed (%d), "
+                    "aborting dormant", err);
+            goto abort_dormant_resume;
         }
     }
 
@@ -1558,6 +1589,17 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
     ps2_uart_release_bus(config->ps2_device);
 
     data->pm_state = TP_PM_DORMANT;
+    return;
+
+abort_dormant_resume:
+    ps2_uart_pm_resume(config->ps2_device, data->uart_dev);
+abort_dormant:
+    ps2_uart_release_bus(config->ps2_device);
+    ps2_enable_callback(config->ps2_device);
+    data->pm_state = TP_PM_ACTIVE;
+    k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
+                                K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+    LOG_WRN("TP idle PM: dormant aborted, returning to ACTIVE");
 }
 
 static void tp_idle_pm_wake_handler(struct k_work *work) {
@@ -1714,6 +1756,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
                 "force-enabling callback", err_f4);
         ps2_enable_callback(config->ps2_device);
     } else {
+        data->recovery_fail_count = 0;
         LOG_INF("TP idle PM: wake complete (F5+F4, no settings re-apply)");
     }
 
