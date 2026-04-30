@@ -533,7 +533,7 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
         data->tp_reach, MOUSE_PS2_CMD_TP_SET_REACH_DEFAULT);
 
     // Config byte (0x2C): PTS, InvertX, InvertY, SwapXY.
-    // Uses write-then-verify internally (3 attempts with readback).
+    // Trusts ACK (no read-back verify) — matches Linux trackpoint_write().
     {
         uint8_t desired = zmk_mouse_ps2_tp_desired_config_byte(config);
         APPLY_SETTING_IF_CHANGED(
@@ -1565,7 +1565,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    Also restores error interrupt and purges the data queue.
      *    CLK stays inhibited on return — both UARTEs are armed but
      *    the TP cannot transmit, preventing stale movement bytes
-     *    from contaminating the verify reads below.
+     *    from contaminating the setting writes below.
      *
      *    If resume fails after 3 retries, stay in DORMANT to avoid
      *    an unrecoverable broken-ACTIVE state. */
@@ -2023,53 +2023,23 @@ int zmk_mouse_ps2_tp_get_config_byte(const struct device* dev, uint8_t *config_b
 }
 
 int zmk_mouse_ps2_tp_set_config_byte_direct(const struct device *dev, uint8_t desired) {
-    /* Write-then-verify loop for the config byte (register 0x2C).
+    /* Write config byte (register 0x2C) and trust the ACK.
      *
-     * This register controls InvertX, InvertY, SwapXY, and PTS —
-     * corruption causes rotation/teleporting that persists until
-     * the register is rewritten.  With the diversity receiver
-     * providing reliable reads (1/21 tiling invariants guarantee
-     * correct decoding), we can verify each write landed correctly
-     * and retry on mismatch.
-     *
-     * The read-back adds ~3 PS/2 byte round-trips (~200µs each)
-     * per attempt, negligible in the context of a batch timeslot. */
-    for (int attempt = 0; attempt < 3; attempt++) {
-        struct zmk_mouse_ps2_send_cmd_resp resp = zmk_mouse_ps2_send_cmd(
-            dev,
-            MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE, sizeof(MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE), &desired,
-            MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE_RESP_LEN, true);
-        if (resp.err) {
-            LOG_ERR("Config byte write failed on attempt %d/3 (0x%02x): %d",
-                    attempt + 1, desired, resp.err);
-            continue;
-        }
-
-        /* Read back and verify */
-        uint8_t readback;
-        int read_err = zmk_mouse_ps2_tp_get_config_byte(dev, &readback);
-        if (read_err) {
-            LOG_WRN("Config byte verify read failed on attempt %d/3: %d",
-                    attempt + 1, read_err);
-            continue;
-        }
-
-        if (readback == desired) {
-            if (attempt > 0) {
-                LOG_WRN("Config byte verified on attempt %d/3 "
-                        "(0x%02x)", attempt + 1, desired);
-            }
-            return 0;
-        }
-
-        LOG_WRN("Config byte mismatch on attempt %d/3: "
-                "wrote 0x%02x, read 0x%02x",
-                attempt + 1, desired, readback);
+     * Linux trackpoint_write() uses the same pattern: send the
+     * write command and rely on the PS/2 ACK — no read-back.
+     * Removing the verify-read halves bus exposure during the
+     * wake batch, which is the window most vulnerable to BLE
+     * ZLI preempting the GPIOTE ISR and causing SCL timeouts. */
+    struct zmk_mouse_ps2_send_cmd_resp resp = zmk_mouse_ps2_send_cmd(
+        dev,
+        MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE, sizeof(MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE), &desired,
+        MOUSE_PS2_CMD_TP_SET_CONFIG_BYTE_RESP_LEN, true);
+    if (resp.err) {
+        LOG_ERR("Config byte write failed (0x%02x): %d", desired, resp.err);
+        return resp.err;
     }
 
-    LOG_ERR("Config byte verification failed after 3 attempts "
-            "(desired 0x%02x)", desired);
-    return -EIO;
+    return 0;
 }
 
 int zmk_mouse_ps2_tp_set_config_option(const struct device *dev,
