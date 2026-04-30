@@ -1242,32 +1242,32 @@ static int ps2_uart_timeslot_acquire(void)
         return -ENODEV;
     }
 
-    // Wait for the session to be truly IDLE before requesting.
-    // After a timeslot ends (ACTION_END), MPSL sends SESSION_IDLE
-    // asynchronously.  Requesting before that signal returns -35.
-    for (int i = 0; i < 1000; i++) {
-        if (atomic_get(&ts_session_idle)) {
-            break;
-        }
-        k_busy_wait(10);
-    }
-    if (!atomic_get(&ts_session_idle)) {
-        LOG_WRN("MPSL session not idle after 10ms");
-        return -EBUSY;
-    }
-
     atomic_set(&ts_started, 0);
     atomic_set(&ts_blocked, 0);
-    atomic_set(&ts_session_idle, 0);
 
     // Set the TIMER0 expiry for the per-byte timeslot length
     // before requesting — the signal handler reads this on START.
     ts_current_timer_expiry_us = PS2_UART_TIMESLOT_TIMER_EXPIRY_US;
 
-    err = mpsl_timeslot_request(ts_session_id, &ts_request_earliest);
+    // Retry mpsl_timeslot_request() with backoff.  It returns
+    // -NRF_EAGAIN (-35) when the session is not IDLE — which happens
+    // briefly after ACTION_END (before SESSION_IDLE signal) or after
+    // BLOCKED/CANCELLED (where SESSION_IDLE is never sent).
+    // Rather than tracking MPSL's internal state with a flag (which
+    // races), just retry the actual request.
+    for (int i = 0; i < 100; i++) {
+        err = mpsl_timeslot_request(ts_session_id, &ts_request_earliest);
+        if (err == 0) {
+            break;
+        }
+        if (err != -NRF_EAGAIN) {
+            LOG_WRN("MPSL timeslot request error: %d", err);
+            return -EBUSY;
+        }
+        k_busy_wait(100);
+    }
     if (err) {
-        LOG_WRN("MPSL timeslot request failed: %d", err);
-        atomic_set(&ts_session_idle, 1);
+        LOG_DBG("MPSL timeslot request gave up after 10ms");
         return -EBUSY;
     }
 
@@ -1293,24 +1293,11 @@ static int ps2_uart_timeslot_acquire(void)
 static void ps2_uart_timeslot_end_and_wait(void)
 {
     // If the timeslot already ended (EXTEND_FAILED → ACTION_END set
-    // ts_started=0, and SESSION_IDLE set ts_session_idle=1), skip the
-    // TIMER0 manipulation — the peripheral is no longer ours.
-    if (atomic_get(&ts_session_idle)) {
-        atomic_set(&ts_started, 0);
-        atomic_set(&ts_force_end, 0);
-        return;
-    }
-
+    // ts_started=0), skip the TIMER0 manipulation — the peripheral
+    // is no longer ours.
     if (!atomic_get(&ts_started)) {
-        // Timeslot ended but SESSION_IDLE hasn't arrived yet.
-        // Just wait for it — don't touch TIMER0.
-        for (int i = 0; i < 1000; i++) {
-            if (atomic_get(&ts_session_idle)) {
-                break;
-            }
-            k_busy_wait(10);
-        }
-        atomic_set(&ts_started, 0);
+        // Timeslot already ended.  Wait briefly for ts_started to
+        // settle (it's set from ISR context).
         atomic_set(&ts_force_end, 0);
         return;
     }
@@ -1325,17 +1312,15 @@ static void ps2_uart_timeslot_end_and_wait(void)
     nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0, now + 1);
     nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
 
-    // Wait for MPSL to end the timeslot AND signal SESSION_IDLE.
-    // ts_started goes to 0 when the signal handler returns ACTION_END.
-    // ts_session_idle goes to 1 when MPSL sends SIGNAL_SESSION_IDLE.
-    // Only after SESSION_IDLE is mpsl_timeslot_request() safe to call.
-    for (int i = 0; i < 1000; i++) {
-        if (atomic_get(&ts_session_idle)) {
+    // Wait for ACTION_END to clear ts_started.  We don't need to wait
+    // for SESSION_IDLE here — the retry loop in timeslot_acquire()
+    // and batch_begin() handles -NRF_EAGAIN if we request too soon.
+    for (int i = 0; i < 2000; i++) {
+        if (!atomic_get(&ts_started)) {
             break;
         }
         k_busy_wait(10);
     }
-    atomic_set(&ts_started, 0);
     atomic_set(&ts_force_end, 0);
 }
 
@@ -1366,30 +1351,28 @@ int ps2_uart_timeslot_batch_begin(void)
         return 0;
     }
 
-    // Wait for session to be IDLE (see comment in timeslot_acquire).
-    for (int i = 0; i < 1000; i++) {
-        if (atomic_get(&ts_session_idle)) {
-            break;
-        }
-        k_busy_wait(10);
-    }
-    if (!atomic_get(&ts_session_idle)) {
-        LOG_WRN("MPSL session not idle for batch request");
-        return -EBUSY;
-    }
-
     atomic_set(&ts_started, 0);
     atomic_set(&ts_blocked, 0);
-    atomic_set(&ts_session_idle, 0);
     atomic_set(&ts_batch_active, 0);
 
     // Set the TIMER0 expiry for the batch timeslot length.
     ts_current_timer_expiry_us = PS2_UART_TIMESLOT_BATCH_TIMER_EXPIRY_US;
 
-    err = mpsl_timeslot_request(ts_session_id, &ts_request_batch);
+    // Retry mpsl_timeslot_request() with backoff — same rationale as
+    // timeslot_acquire().  Returns -NRF_EAGAIN when session not IDLE.
+    for (int i = 0; i < 100; i++) {
+        err = mpsl_timeslot_request(ts_session_id, &ts_request_batch);
+        if (err == 0) {
+            break;
+        }
+        if (err != -NRF_EAGAIN) {
+            LOG_WRN("MPSL batch timeslot request error: %d", err);
+            return -EBUSY;
+        }
+        k_busy_wait(100);
+    }
     if (err) {
-        LOG_WRN("MPSL batch timeslot request failed: %d", err);
-        atomic_set(&ts_session_idle, 1);
+        LOG_DBG("MPSL batch timeslot request gave up after 10ms");
         return -EBUSY;
     }
 
