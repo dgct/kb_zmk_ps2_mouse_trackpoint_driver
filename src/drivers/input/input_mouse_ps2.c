@@ -539,13 +539,13 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
         zmk_mouse_ps2_tp_reach_set(dev, data->tp_reach),
         data->tp_reach, MOUSE_PS2_CMD_TP_SET_REACH_DEFAULT);
 
-    // Always write the config byte — it controls orientation bits
-    // (InvertX/Y, SwapXY) and PTS, which are the most critical
-    // registers to get right.  The verify-after-write inside
-    // set_config_byte_direct catches corruption.
+    // Config byte (0x2C): PTS, InvertX, InvertY, SwapXY.
+    // Uses write-then-verify internally (3 attempts with readback).
     {
         uint8_t desired = zmk_mouse_ps2_tp_desired_config_byte(config);
-        APPLY_SETTING(zmk_mouse_ps2_tp_set_config_byte_direct(dev, desired));
+        APPLY_SETTING_IF_CHANGED(
+            zmk_mouse_ps2_tp_set_config_byte_direct(dev, desired),
+            desired, 0x00);
     }
 
     if (config->tp_press_to_select) {
