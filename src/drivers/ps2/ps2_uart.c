@@ -179,11 +179,11 @@ LOG_MODULE_REGISTER(ps2_uart);
 #define PS2_UART_TIMING_SCL_CYCLE_MAX 100
 
 // After inhibiting and releasing the clock, the device starts sending
-// the clock. PS/2 spec allows up to 15ms for the device to respond
-// with the first clock pulse (Chapweske §Host-to-Device, time (a)).
-// Previously 3ms — well below spec, causing ~25% per-byte timeouts
-// on TrackPoint wake-from-dormant command sequences.
-#define PS2_UART_TIMING_SCL_INHIBITION_RESP_MAX 15000
+// the clock.  PS/2 spec allows up to 15ms (Chapweske §Host-to-Device,
+// time (a)), but the TP normally responds in <1ms.  Using the full
+// 15ms burns the per-byte retry budget on genuine NACKs.  5ms gives
+// 50× the typical response time while keeping retries responsive.
+#define PS2_UART_TIMING_SCL_INHIBITION_RESP_MAX 5000
 #define PS2_UART_TIMEOUT_WRITE_SCL_START K_USEC(PS2_UART_TIMING_SCL_INHIBITION_RESP_MAX)
 
 // Max time we allow the device to send the next clock signal during writes.

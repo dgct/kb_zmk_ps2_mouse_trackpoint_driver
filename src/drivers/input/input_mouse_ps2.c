@@ -1263,47 +1263,79 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
         }
     }
 
+    /* Command-level retry for multi-byte commands.  Single-byte commands
+     * (F5, F4, etc.) already get 3 per-byte retries in ps2_uart_write_byte().
+     * Multi-byte commands (e.g. 0xe2 extended register writes) need
+     * command-level retry because a NACK on any byte corrupts the
+     * in-progress sequence, requiring a restart from byte 0.
+     *
+     * With 3 per-byte retries × 3 command attempts = 9 total byte-level
+     * tries per command — enough to ride out transient post-wake NACKs
+     * without excessive bus time. */
     if (resp.err == 0) {
-        LOG_DBG("Sending cmd...");
+        int max_cmd_attempts = (cmd_bytes > 1) ? 3 : 1;
 
-        for (int i = 0; i < cmd_bytes; i++) {
-            resp.err = ps2_write(ps2_device, cmd[i]);
-            if (resp.err) {
-                snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not send cmd byte %d/%d (%d)",
-                         i + 1, cmd_bytes, resp.err);
-                if (i > 0 && cmd[0] == '\xe2') {
-                    LOG_WRN("Partial 0xE2 extended command: %d/%d bytes sent. "
-                            "Sleeping 25ms to let TP command parser timeout "
-                            "and discard the partial sequence.",
-                            i, cmd_bytes);
-                    k_msleep(25);
+        for (int attempt = 0; attempt < max_cmd_attempts; attempt++) {
+            if (attempt > 0) {
+                LOG_WRN("send_cmd: retry %d/%d for %d-byte cmd (0x%02x...)",
+                        attempt + 1, max_cmd_attempts, cmd_bytes, (uint8_t)cmd[0]);
+                resp.err = 0;
+                resp.err_msg[0] = '\0';
+                memset(resp.resp_buffer, 0, sizeof(resp.resp_buffer));
+            }
+
+            LOG_DBG("Sending cmd...");
+
+            for (int i = 0; i < cmd_bytes; i++) {
+                resp.err = ps2_write(ps2_device, cmd[i]);
+                if (resp.err) {
+                    snprintf(resp.err_msg, sizeof(resp.err_msg),
+                             "Could not send cmd byte %d/%d (%d)",
+                             i + 1, cmd_bytes, resp.err);
+                    if (i > 0 && cmd[0] == '\xe2') {
+                        LOG_WRN("Partial 0xE2 extended command: %d/%d bytes sent. "
+                                "Sleeping 25ms to let TP command parser timeout "
+                                "and discard the partial sequence.",
+                                i, cmd_bytes);
+                        k_msleep(25);
+                    }
+                    break;
                 }
-                break;
             }
-        }
-    }
 
-    if (resp.err == 0 && arg != NULL) {
-        LOG_DBG("Sending arg...");
-        resp.err = ps2_write(ps2_device, *arg);
-        if (resp.err) {
-            snprintf(resp.err_msg, sizeof(resp.err_msg), "Could not send arg (%d)", resp.err);
-            if (cmd[0] == '\xe2') {
-                LOG_WRN("0xE2 extended command sent but arg byte failed. "
-                        "Sleeping 25ms to let TP command parser timeout "
-                        "and discard the pending write.");
-                k_msleep(25);
+            if (resp.err == 0 && arg != NULL) {
+                LOG_DBG("Sending arg...");
+                resp.err = ps2_write(ps2_device, *arg);
+                if (resp.err) {
+                    snprintf(resp.err_msg, sizeof(resp.err_msg),
+                             "Could not send arg (%d)", resp.err);
+                    if (cmd[0] == '\xe2') {
+                        LOG_WRN("0xE2 extended command sent but arg byte failed. "
+                                "Sleeping 25ms to let TP command parser timeout "
+                                "and discard the pending write.");
+                        k_msleep(25);
+                    }
+                }
             }
-        }
-    }
 
-    if (resp.err == 0 && resp_len > 0) {
-        LOG_DBG("Reading response...");
-        for (int i = 0; i < resp_len; i++) {
-            resp.err = ps2_read(ps2_device, &resp.resp_buffer[i]);
-            if (resp.err) {
-                snprintf(resp.err_msg, sizeof(resp.err_msg),
-                         "Could not read response cmd byte %d/%d (%d)", i + 1, resp_len, resp.err);
+            if (resp.err == 0 && resp_len > 0) {
+                LOG_DBG("Reading response...");
+                for (int i = 0; i < resp_len; i++) {
+                    resp.err = ps2_read(ps2_device, &resp.resp_buffer[i]);
+                    if (resp.err) {
+                        snprintf(resp.err_msg, sizeof(resp.err_msg),
+                                 "Could not read response cmd byte %d/%d (%d)",
+                                 i + 1, resp_len, resp.err);
+                        break;
+                    }
+                }
+            }
+
+            if (resp.err == 0) {
+                if (attempt > 0) {
+                    LOG_INF("send_cmd: succeeded on attempt %d/%d",
+                            attempt + 1, max_cmd_attempts);
+                }
                 break;
             }
         }
