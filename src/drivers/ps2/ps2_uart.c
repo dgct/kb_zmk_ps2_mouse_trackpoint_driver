@@ -318,6 +318,7 @@ static struct k_work_q ps2_uart_work_queue_cb;
 // Signal handler runs at priority 0, cannot use kernel APIs.
 static atomic_t ts_started = ATOMIC_INIT(0);
 static atomic_t ts_blocked = ATOMIC_INIT(0);
+static atomic_t ts_force_end = ATOMIC_INIT(0);
 
 // Batch refcount: when > 0, write_byte_blocking() skips per-byte
 // timeslot acquire/release and relies on the batch timeslot.
@@ -1145,7 +1146,8 @@ static mpsl_timeslot_signal_return_param_t *ps2_uart_timeslot_cb(
         nrf_timer_int_disable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
         nrf_timer_event_clear(MPSL_TIMER0, NRF_TIMER_EVENT_COMPARE0);
 
-        if (atomic_get(&ts_batch_active) > 0) {
+        if (atomic_get(&ts_batch_active) > 0 &&
+            !atomic_get(&ts_force_end)) {
             // Batch still running — request extension instead of ending.
             // MPSL grants extension only if no BLE activity is scheduled.
             ts_return_param.callback_action =
@@ -1155,6 +1157,7 @@ static mpsl_timeslot_signal_return_param_t *ps2_uart_timeslot_cb(
             return &ts_return_param;
         }
 
+        atomic_set(&ts_force_end, 0);
         atomic_set(&ts_started, 0);
 
         ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_END;
@@ -1259,9 +1262,12 @@ static int ps2_uart_timeslot_acquire(void)
 // Mark that we're done with the timeslot. TIMER0 will end it naturally.
 static void ps2_uart_timeslot_release(void)
 {
+    // Tell the signal handler to return ACTION_END unconditionally,
+    // even if batch_active > 0 (we're releasing a per-byte timeslot
+    // that was acquired because the batch timeslot expired).
+    atomic_set(&ts_force_end, 1);
+
     // Force TIMER0 to fire immediately so MPSL returns ACTION_END.
-    // Without this, the timeslot stays active and blocks subsequent
-    // mpsl_timeslot_request() with -35.
     nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0, 1);
     nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
 
@@ -1272,6 +1278,7 @@ static void ps2_uart_timeslot_release(void)
         k_busy_wait(10);
     }
     atomic_set(&ts_started, 0);
+    atomic_set(&ts_force_end, 0);
 }
 
 // --- Batch timeslot API (exposed via ps2_uart_timeslot.h) ---
