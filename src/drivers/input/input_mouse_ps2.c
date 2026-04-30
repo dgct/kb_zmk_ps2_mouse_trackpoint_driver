@@ -342,10 +342,6 @@ struct zmk_mouse_ps2_data {
                                    * reports the offset as a large movement (teleportation).
                                    * Squelch window lets the user release the stick. */
 
-    int64_t last_byte_time;       /* uptime_ms of most recent PS/2 byte from TP */
-    int liveness_retries;         /* consecutive watchdog recovery attempts */
-    struct k_work_delayable liveness_watchdog;
-
     void *activity_callback;
     void *activity_resend_callback;
 
@@ -577,7 +573,6 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
 }
 
 static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work);
-static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work);
 
 struct zmk_mouse_ps2_packet
 zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode,
@@ -589,10 +584,6 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
 void zmk_mouse_ps2_activity_callback(const struct device *dev,
                                      const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = dev->data;
-
-    data->last_byte_time = k_uptime_get();
-    data->liveness_retries = 0;
-    k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
 
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
@@ -918,122 +909,6 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
         LOG_WRN("TP self-reset recovery: completed with %d setting failure(s)", ret);
     } else {
         LOG_WRN("TP self-reset recovery: all settings re-applied");
-    }
-}
-
-/*
- * TP Liveness Watchdog
- *
- * One-shot watchdog rescheduled on every incoming byte.  If no bytes
- * arrive for 5 seconds while reporting is supposed to be on, something
- * silently killed the TP.  Force-resend F4 and re-enable the callback.
- *
- * Escalation ladder:
- *   Attempt  0:   full recovery (re-apply all settings + F4), 5s interval.
- *   Attempts 1-2: lightweight F4 probe only, 5s interval.
- *   Attempt  3+:  send 0xFF (full reset), re-apply all settings via
- *                 the self-reset work handler, 30s interval.
- *
- * Never gives up.  When the TP recovers, activity_callback resets
- * retries to 0 and the watchdog returns to the normal 5s cadence.
- */
-static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
-    struct k_work_delayable *dwork = (struct k_work_delayable *)work;
-    struct zmk_mouse_ps2_data *data = CONTAINER_OF(dwork, struct zmk_mouse_ps2_data,
-                                                   liveness_watchdog);
-    const struct device *dev = data->dev;
-    const struct zmk_mouse_ps2_config *config = dev->config;
-
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
-    /* Don't probe while dormant or entering dormant — the UART may be
-     * suspended and no bytes are expected.  The wake handler restarts
-     * the watchdog when it returns to ACTIVE. */
-    if (data->pm_state != TP_PM_ACTIVE) {
-        return;
-    }
-#endif
-
-    int64_t silence = k_uptime_get() - data->last_byte_time;
-    if (silence < 5000) {
-        /* A byte arrived between scheduling and firing; reschedule. */
-        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
-        return;
-    }
-
-    int attempt = data->liveness_retries++;
-
-    if (attempt == 0) {
-        /* --- First attempt after wake from dormant (or fresh boot).
-         *
-         * The TP may have self-reset during dormant (ESD, power glitch)
-         * which reverts all registers to factory defaults AND disables
-         * reporting.  We missed the 0xAA 0x00 sequence because the UART
-         * was suspended.
-         *
-         * Do a full recovery: re-apply all settings + F4.  This is
-         * idempotent if the TP didn't self-reset (settings are written
-         * to the same values), costs ~20ms, and fixes the "factory
-         * settings after wake" problem. */
-        LOG_WRN("TP liveness: first probe — no data for %lld ms, "
-                "doing full settings re-apply + F4", silence);
-
-        int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
-        if (ret < 0) {
-            LOG_ERR("TP liveness: F4 re-enable failed (%d)", ret);
-        } else if (ret > 0) {
-            LOG_WRN("TP liveness: %d setting(s) failed during recovery", ret);
-        }
-
-        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
-    } else if (attempt < 3) {
-        /* --- Stage 1: lightweight F4 probe --- */
-        LOG_WRN("TP liveness: attempt %d/3 — no data for %lld ms, sending F4",
-                attempt + 1, silence);
-
-        data->activity_reporting_on = false;
-        int err = zmk_mouse_ps2_activity_reporting_enable(dev);
-        if (err) {
-            LOG_ERR("TP liveness: failed to re-enable reporting (%d)", err);
-            ps2_enable_callback(config->ps2_device);
-        }
-
-        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
-    } else {
-        /* --- Stage 2: escalate to full 0xFF reset --- */
-        LOG_WRN("TP liveness: attempt %d — F4 failed 3×, sending 0xFF reset "
-                "(%lld ms silence)", attempt + 1, silence);
-
-        int err = zmk_mouse_ps2_reset(dev, config->ps2_device);
-        if (err) {
-            LOG_ERR("TP liveness: 0xFF reset failed (%d)", err);
-            /* Still try re-enabling the callback in case the bus is
-             * stuck but partially functional. */
-            ps2_enable_callback(config->ps2_device);
-        } else {
-            /* Give the TP time to complete BAT (up to ~500ms). */
-            k_sleep(K_MSEC(600));
-
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
-            /* Re-check: idle PM may have started a dormant transition
-             * while we were sleeping.  Abort recovery — the wake
-             * handler will take over when the user next moves the TP. */
-            if (data->pm_state != TP_PM_ACTIVE) {
-                LOG_WRN("TP liveness: PM state changed during BAT wait, aborting");
-                return;
-            }
-#endif
-
-            /* Reset the packet buffer — any partial state is stale
-             * after a full reset. */
-            zmk_mouse_ps2_activity_reset_packet_buffer(dev);
-        }
-
-        /* Re-apply all settings and re-enable reporting.  Reuse the
-         * self-reset work handler which already does the full
-         * apply-all-settings + retry-F4 sequence. */
-        k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
-
-        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(30));
     }
 }
 
@@ -1555,11 +1430,6 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
 
     LOG_INF("TP idle PM: entering DORMANT (phase 1: disable callback)");
 
-    /* Cancel the liveness watchdog — UART will be suspended and no bytes
-     * will arrive.  Without this, the watchdog fires on a dead bus and
-     * exhausts its retries before the wake handler can restart it. */
-    k_work_cancel_delayable(&data->liveness_watchdog);
-
     /* 1. Disable the PS/2 callback so no packets are processed during
      *    the transition.  Crucially, we do NOT send F5 (disable
      *    reporting) — the TP must remain in reporting-enabled state so
@@ -1658,11 +1528,6 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         }
 
         data->pm_state = TP_PM_ACTIVE;
-
-        /* Restart liveness watchdog (phase 1 cancelled it) */
-        data->last_byte_time = k_uptime_get();
-        data->liveness_retries = 0;
-        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
 
         /* Restart idle timer */
         k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
@@ -1779,12 +1644,8 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         LOG_INF("TP idle PM: wake recovery complete (all settings applied)");
     }
 
-    /* 6. Restart the liveness watchdog and idle timer. */
-    data->last_byte_time = k_uptime_get();
-    data->liveness_retries = 0;
-    k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
+    /* 6. Restart the idle timer. */
 
-    /* Restart the idle timer */
     k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
                                 K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
 }
@@ -1812,11 +1673,6 @@ static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data) {
 
         /* Restore pm_state — phase 1 set it to ENTERING_DORMANT */
         data->pm_state = TP_PM_ACTIVE;
-
-        /* Restart liveness watchdog (phase 1 cancelled it) */
-        data->last_byte_time = k_uptime_get();
-        data->liveness_retries = 0;
-        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
     }
     k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
                                 K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
@@ -3222,7 +3078,6 @@ int zmk_mouse_ps2_settings_init(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
 
     k_work_init(&data->tp_self_reset_work, zmk_mouse_ps2_tp_self_reset_work_handler);
-    k_work_init_delayable(&data->liveness_watchdog, zmk_mouse_ps2_liveness_watchdog_handler);
 
 #if IS_ENABLED(CONFIG_SETTINGS)
     LOG_DBG("");
@@ -3394,8 +3249,6 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         LOG_ERR("Could not activate ps2 callback: %d", err);
     } else {
         LOG_DBG("Successfully activated ps2 callback");
-        data->last_byte_time = k_uptime_get();
-
         if (!tp_mgmt_wq_started) {
             k_work_queue_init(&tp_mgmt_wq);
             k_work_queue_start(&tp_mgmt_wq, tp_mgmt_wq_stack,
@@ -3405,7 +3258,6 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
             tp_mgmt_wq_started = true;
         }
 
-        k_work_schedule_for_queue(&tp_mgmt_wq, &data->liveness_watchdog, K_SECONDS(5));
     }
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
