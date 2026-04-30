@@ -1721,6 +1721,16 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      * and activity callback see the correct PM state. */
     data->pm_state = TP_PM_ACTIVE;
 
+    /* Purge stale bytes from the PS/2 data queue.  During the 5ms
+     * drain window (phase 1 → phase 2), the UART was still running
+     * but the callback was disabled — any movement bytes the TP sent
+     * went into the data queue.  After bus release above, the TP may
+     * also have started transmitting immediately.  If these stale
+     * bytes are not purged, the verify reads below will consume them
+     * as "responses" to register read commands, causing the config
+     * byte to appear corrupted on every wake cycle. */
+    ps2_uart_data_queue_empty(config->ps2_device);
+
     /* 5. Fast-path wake: verify config byte, skip full recovery if OK.
      *
      *    With the GPIO_OUTPUT_LOW CLK inhibit fix, pin transitions no

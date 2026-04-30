@@ -66,3 +66,12 @@ void ps2_uart_inhibit_bus(const struct device *dev);
  * @param dev  The PS/2 UART device (e.g. config->ps2_device).
  */
 void ps2_uart_release_bus(const struct device *dev);
+
+/**
+ * Purge the PS/2 UART data queue, discarding any stale bytes
+ * that accumulated while the callback was disabled (e.g. during
+ * idle PM dormant drain window).
+ *
+ * @param dev  The PS/2 UART device (e.g. config->ps2_device).
+ */
+void ps2_uart_data_queue_empty(const struct device *dev);
