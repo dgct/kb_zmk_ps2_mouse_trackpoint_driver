@@ -59,6 +59,7 @@ static volatile uint8_t  uarte1_last_byte;
 static volatile uint32_t uarte1_last_err;
 static volatile bool     uarte1_byte_ready;
 static bool              uarte1_initialized;
+static bool              uart_suspended;
 
 /* Error counters */
 static uint32_t diversity_err_uarte0_framing;
@@ -522,6 +523,7 @@ void ps2_uart_release_bus(const struct device *dev) {
  * Returns 0 on success, negative errno on failure.
  */
 int ps2_uart_pm_suspend(const struct device *dev, const struct device *uart_dev) {
+    uart_suspended = true;
     ps2_uart_diversity_stop_rx();
 
     int err = pm_device_action_run(uart_dev, PM_DEVICE_ACTION_SUSPEND);
@@ -571,6 +573,8 @@ int ps2_uart_pm_resume(const struct device *dev, const struct device *uart_dev) 
         LOG_ERR("ps2_uart_pm_resume: failed after 3 attempts (%d)", err);
         return err;
     }
+
+    uart_suspended = false;
 
     /* Restore UART error interrupt — Zephyr PM doesn't save/restore it */
     uart_irq_err_enable(uart_dev);
@@ -1077,7 +1081,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
         }
         k_work_submit_to_queue(&ps2_uart_work_queue_cb, &data->callback_work);
     } else {
-        LOG_WRN("data_queue <-- 0x%02x (awaits_resp=%d, cb_en=%d)",
+        LOG_DBG("data_queue <-- 0x%02x (awaits_resp=%d, cb_en=%d)",
                 byte, data->write_awaits_resp, data->callback_enabled);
         ps2_uart_data_queue_add(dev, byte);
     }
@@ -2331,6 +2335,16 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
     if (cal_dev == NULL) {
+        return;
+    }
+
+    /* Don't burn retries while the UART is suspended (TP dormant) —
+     * no CLK edges are possible.  Re-schedule for after wake. */
+    if (uart_suspended) {
+        LOG_INF("Deferred calibration: UART suspended, deferring %d ms",
+                PS2_UART_DEFERRED_CAL_RETRY_MS);
+        k_work_schedule(&deferred_cal_work,
+                       K_MSEC(PS2_UART_DEFERRED_CAL_RETRY_MS));
         return;
     }
 

@@ -69,9 +69,6 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define MOUSE_PS2_CMD_SET_SAMPLING_RATE_RESP_LEN 0
 #define MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT 100
 
-#define MOUSE_PS2_CMD_STATUS_REQUEST "\xe9"
-#define MOUSE_PS2_CMD_STATUS_REQUEST_RESP_LEN 3
-
 #define MOUSE_PS2_CMD_ENABLE_REPORTING "\xf4"
 #define MOUSE_PS2_CMD_ENABLE_REPORTING_RESP_LEN 0
 
@@ -227,7 +224,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /*
  * Dedicated work queue for TP management operations (self-reset recovery,
- * liveness watchdog, idle PM wake/dormant).  These involve blocking PS/2
+ * idle PM wake/dormant).  These involve blocking PS/2
  * writes that would otherwise stall the system workqueue for 50-80 ms on
  * a healthy bus and potentially seconds on a degraded one.
  *
@@ -754,8 +751,6 @@ static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
      *     silences it so register writes don't collide with movement data.
      *   - Self-reset (0xAA 0x00): TP already has reporting disabled
      *     post-reset — F5 gets ACK'd as a no-op.
-     *   - Liveness watchdog: TP may or may not be streaming — F5 is
-     *     safe either way.
      *
      * If F5 fails (e.g. bus contention), we proceed anyway — no worse
      * than the previous code which never sent F5 at all. */
@@ -809,16 +804,15 @@ static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
 
 /*
  * Full TP recovery transaction: restore all settings + re-enable
- * reporting.  Single entry point for self-reset recovery, liveness
- * watchdog, and any future recovery path.
+ * reporting.  Single entry point for self-reset recovery and any
+ * future recovery path.
  *
  * Owns the batch timeslot lifecycle: acquires a 100 ms MPSL timeslot
  * before any writes and holds it through the F4 re-enable, so every
  * byte — including the critical F4 — is shielded from BLE ZLI.
  *
  * If all F4 attempts fail, force-enables the PS/2 callback so future
- * self-resets can still be detected, and the liveness watchdog can
- * retry on its next firing.
+ * self-resets can still be detected.
  *
  * Returns 0 on full success, negative errno on F4 failure (settings
  * may still have been applied), or a positive count of setting
@@ -857,8 +851,7 @@ static int zmk_mouse_ps2_tp_recover_and_enable(const struct device *dev) {
     if (err) {
         LOG_ERR("TP recovery: all F4 re-enable attempts failed (%d)", err);
         /* Force-enable the callback so we can still detect future
-         * self-resets even if the F4 command failed.  The liveness
-         * watchdog will retry on its next firing. */
+         * self-resets even if the F4 command failed. */
         ps2_enable_callback(config->ps2_device);
         ps2_uart_timeslot_batch_end();
         return -EIO;
@@ -1547,8 +1540,8 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     int err;
 
     if (data->pm_state == TP_PM_ENTERING_DORMANT) {
-        /* Lightweight abort: phase 1 ran (callback disabled, liveness
-         * cancelled) but UART is still active and TP is still reporting.
+        /* Lightweight abort: phase 1 ran (callback disabled) but
+         * UART is still active and TP is still reporting.
          * Just undo phase 1 and return to ACTIVE — no tare risk. */
         LOG_INF("TP idle PM: aborting dormant transition (activity during drain)");
 
@@ -1620,8 +1613,8 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    to be swallowed. */
     data->tp_self_reset_pending = false;
 
-    /* Transition to ACTIVE before recovery so the watchdog handler
-     * and activity callback see the correct PM state. */
+    /* Transition to ACTIVE before recovery so the activity callback
+     * sees the correct PM state. */
     data->pm_state = TP_PM_ACTIVE;
 
     /* 4.5. Silence the TP before any register writes.
