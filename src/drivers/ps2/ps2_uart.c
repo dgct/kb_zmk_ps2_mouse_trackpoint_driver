@@ -1158,13 +1158,13 @@ static int ps2_uart_timeslot_acquire(void)
             return 0;
         }
         if (atomic_get(&ts_blocked)) {
-            LOG_WRN("MPSL timeslot blocked, proceeding with unprotected write");
+            LOG_DBG("MPSL timeslot blocked");
             return -EBUSY;
         }
         k_busy_wait(PS2_UART_TIMESLOT_POLL_INTERVAL_US);
     }
 
-    LOG_WRN("MPSL timeslot poll timed out, proceeding with unprotected write");
+    LOG_DBG("MPSL timeslot poll timed out");
     return -ETIMEDOUT;
 }
 
@@ -1429,17 +1429,29 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
     int ts_err = -EBUSY;
 
     if (!in_batch) {
-        // Per-byte timeslot acquire (original behavior).
-        // Retry up to 3 times with a short sleep to let a BLE
-        // radio event finish.
-        for (int ts_attempt = 0; ts_attempt < 3; ts_attempt++) {
+        // Per-byte timeslot acquire with exponential backoff.
+        // BLE connection events typically run 1.25–7.5ms, so
+        // fixed 1ms retries often land inside the same event.
+        // Exponential backoff (2, 4, 8, 16ms) spans progressively
+        // longer windows, giving MPSL more opportunities to fit
+        // our timeslot between radio events.
+        //
+        // HARD GATE: if all attempts fail, we return an error
+        // instead of writing unprotected. The outer write_byte()
+        // retry loop will try again.
+        for (int ts_attempt = 0; ts_attempt < 5; ts_attempt++) {
             ts_err = ps2_uart_timeslot_acquire();
             if (ts_err == 0) {
                 break;
             }
-            if (ts_attempt < 2) {
-                k_msleep(1);
+            if (ts_attempt < 4) {
+                k_msleep(2 << ts_attempt);  // 2, 4, 8, 16ms
             }
+        }
+        if (ts_err != 0) {
+            LOG_WRN("Timeslot acquire failed after 5 attempts for "
+                    "byte 0x%x — refusing unprotected write", byte);
+            return PS2_UART_E_WRITE_TRANSMIT;
         }
     }
 #endif
