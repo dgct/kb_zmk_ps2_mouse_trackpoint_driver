@@ -1575,7 +1575,6 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
      * that could corrupt TP registers (e.g. config byte 0x2C
      * controlling InvertX/InvertY/SwapXY orientation bits). */
     ps2_uart_inhibit_bus(config->ps2_device);
-    k_busy_wait(100); /* PS/2 spec: host must hold CLK LOW ≥100µs */
 
     /* Stop diversity receiver BEFORE suspending UARTE0.
      * UARTE1 must release P0.17 so the GPIO wake interrupt can
@@ -1664,7 +1663,6 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      * state.  Without CLK inhibit the TP could clock in the glitches
      * as a host-initiated PS/2 write, corrupting registers. */
     ps2_uart_inhibit_bus(config->ps2_device);
-    k_busy_wait(100); /* PS/2 spec: host must hold CLK LOW ≥100µs */
 
     /* 1. Disable the wake GPIO interrupt (idempotent — ISR may have
      * already done this) and release the pin so the UART pinctrl can

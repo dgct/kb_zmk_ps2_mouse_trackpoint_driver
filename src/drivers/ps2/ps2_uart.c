@@ -483,6 +483,7 @@ int ps2_uart_set_scl_callback_enabled(const struct device *dev, bool enabled) {
  */
 void ps2_uart_inhibit_bus(const struct device *dev) {
     ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW, "output-low (inhibit)");
+    k_busy_wait(100);  /* PS/2 spec: host must hold CLK LOW ≥100µs */
 }
 
 void ps2_uart_release_bus(const struct device *dev) {
