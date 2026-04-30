@@ -332,12 +332,12 @@ struct zmk_mouse_ps2_data {
     int64_t tp_self_reset_time;   /* uptime_ms when tp_self_reset_pending was set */
     struct k_work tp_self_reset_work;
 
-    int64_t tare_squelch_until;   /* uptime_ms: suppress movement (not clicks) until this time.
+    int tare_squelch_packets;    /* Drop this many movement packets after F4.
                                    * F4 triggers a TARE recalibration — if the user's finger
                                    * is on the stick (e.g. they moved it to wake), the TARE
                                    * sets the current pressure as zero.  On release the TP
                                    * reports the offset as a large movement (teleportation).
-                                   * Squelch window lets the user release the stick. */
+                                   * 3 packets ≈ 15ms at 200Hz — enough for TARE to settle. */
 
     void *activity_callback;
     void *activity_resend_callback;
@@ -863,10 +863,10 @@ static int zmk_mouse_ps2_tp_recover_and_enable(const struct device *dev) {
      * recalibration — if the user's finger is on the stick (e.g.
      * they moved it to wake from dormant), the TP sets the current
      * pressure as the zero reference.  On release it reports the
-     * offset as a large movement (teleportation).  Suppress movement
-     * for 300ms to let the user lift their finger.  Clicks still
+     * offset as a large movement (teleportation).  Drop the first
+     * 3 packets (~15ms at 200Hz) for TARE to settle.  Clicks still
      * pass through. */
-    data->tare_squelch_until = k_uptime_get() + 300;
+    data->tare_squelch_packets = 3;
 
     if (failures > 0) {
         LOG_WRN("TP recovery: completed with %d setting failure(s)", failures);
@@ -913,25 +913,14 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
     packet = zmk_mouse_ps2_activity_parse_packet_buffer(packet_mode, packet_state, packet_x,
                                                         packet_y, packet_extra);
 
-    /* Post-TARE movement squelch: suppress movement (but not button
-     * clicks) for a short window after F4.  F4 triggers a TARE
-     * recalibration — if the user was pressing the stick (e.g. to
-     * wake from sleep), the calibration sets zero at the current
-     * pressure.  On release the TP reports the offset as a large
-     * sudden movement (teleportation). */
-    if (data->tare_squelch_until > 0 && k_uptime_get() < data->tare_squelch_until) {
-        /* Still in squelch window — zero out movement but let
-         * buttons through (user might be clicking). */
+    /* Post-TARE movement squelch: drop the first few packets after
+     * F4.  TARE completes within ~1 packet at 200Hz; we drop 3 for
+     * margin.  Clicks still pass through. */
+    if (data->tare_squelch_packets > 0) {
+        data->tare_squelch_packets--;
         packet.mov_x = 0;
         packet.mov_y = 0;
         packet.scroll = 0;
-    } else if (data->tare_squelch_until > 0) {
-        /* Squelch expired — clear the flag and reset prev_packet
-         * so the delta check doesn't see a huge jump from 0,0 to
-         * the first real movement. */
-        data->tare_squelch_until = 0;
-        data->prev_packet.mov_x = 0;
-        data->prev_packet.mov_y = 0;
     }
 
     int x_delta = abs(data->prev_packet.mov_x - packet.mov_x);
@@ -1681,8 +1670,8 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      * recalibration — if the user's finger is on the stick (which
      * it is, since that's what fired the wake GPIO), the old-to-new
      * baseline delta gets reported as one large movement packet.
-     * Suppress movement (not clicks) for 300ms. */
-    data->tare_squelch_until = k_uptime_get() + 300;
+     * Drop 3 packets (~15ms at 200Hz) for TARE to settle. */
+    data->tare_squelch_packets = 3;
 
     /* 6. Restart the idle timer. */
 
