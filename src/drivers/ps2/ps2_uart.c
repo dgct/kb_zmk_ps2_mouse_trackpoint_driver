@@ -674,9 +674,11 @@ static int ps2_uart_set_mode_write(const struct device *dev) {
         uart_irq_rx_disable(config->uart_dev);
         nrf_uarte_task_trigger(NRF_UARTE0, NRF_UARTE_TASK_STOPRX);
 
-        // Busy-wait for RXTO (receiver fully stopped). Worst case is
-        // ~760us for one PS/2 byte at 14.4kHz; 2ms gives 3x margin.
-        int timeout_us = 2000;
+        // Busy-wait for RXTO (receiver fully stopped).  After STOPRX
+        // the UARTE runs an internal timer clocked at the baud rate,
+        // counting 4 byte-times before firing RXTO.  At ~14.8 kHz:
+        // 4 × (11 bits / 14800) ≈ 3 ms.  Use 4 ms for 33% margin.
+        int timeout_us = 4000;
         while (!nrf_uarte_event_check(NRF_UARTE0, NRF_UARTE_EVENT_RXTO) &&
                timeout_us > 0) {
             k_busy_wait(2);
@@ -2243,7 +2245,9 @@ void ps2_uart_diversity_stop_rx(void) {
 
     nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STOPRX);
 
-    int timeout_us = 2000;
+    // Wait for RXTO: UARTE's internal 4-byte timer needs ~3 ms at
+    // ~14.8 kHz baud.  Use 4 ms for 33% margin.
+    int timeout_us = 4000;
     while (!nrf_uarte_event_check(NRF_UARTE1, NRF_UARTE_EVENT_RXTO) &&
            timeout_us > 0) {
         k_busy_wait(2);

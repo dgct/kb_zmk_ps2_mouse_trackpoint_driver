@@ -746,6 +746,35 @@ static int zmk_mouse_ps2_tp_recover_all(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
     const struct zmk_mouse_ps2_config *config = dev->config;
 
+    /* Send F5 (disable reporting) directly to the TP hardware before
+     * any register writes.  Per PS/2 spec: "If the mouse is in Stream
+     * mode, the host should disable data reporting (command 0xF5)
+     * before sending any other commands."
+     *
+     * We bypass zmk_mouse_ps2_activity_reporting_disable() because:
+     *   1. Its early-return guard (activity_reporting_on == false) would
+     *      skip the actual F5 send — callers often clear the flag before
+     *      entering this function.
+     *   2. It toggles ps2_disable_callback(), but the caller manages
+     *      callback state independently.
+     *
+     * This covers all entry points:
+     *   - Wake from dormant: TP was streaming (never told to stop) — F5
+     *     silences it so register writes don't collide with movement data.
+     *   - Self-reset (0xAA 0x00): TP already has reporting disabled
+     *     post-reset — F5 gets ACK'd as a no-op.
+     *   - Liveness watchdog: TP may or may not be streaming — F5 is
+     *     safe either way.
+     *
+     * If F5 fails (e.g. bus contention), we proceed anyway — no worse
+     * than the previous code which never sent F5 at all. */
+    int f5_err = ps2_write(config->ps2_device,
+                           MOUSE_PS2_CMD_DISABLE_REPORTING[0]);
+    if (f5_err) {
+        LOG_WRN("TP recovery: F5 disable-reporting failed (%d), "
+                "proceeding anyway", f5_err);
+    }
+
     /* Clear the reporting flag before any PS/2 commands.  This
      * prevents send_cmd and apply_all_settings from wrapping each
      * command with F5/F4, which would cause a TARE recalibration
