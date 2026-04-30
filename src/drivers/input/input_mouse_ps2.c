@@ -44,7 +44,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define ZMK_MOUSE_PS2_INIT_THREAD_DELAY_MS 1000
 
 // How often the driver try to initialize a mouse before we give up.
-#define MOUSE_PS2_INIT_ATTEMPTS 10
+#define MOUSE_PS2_INIT_ATTEMPTS 25
 
 // Mouse activity packets are at least three bytes.
 // This defines how much time between bytes can pass before
