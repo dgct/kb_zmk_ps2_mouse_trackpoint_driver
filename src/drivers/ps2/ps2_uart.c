@@ -1752,6 +1752,14 @@ int ps2_uart_write_byte_start(const struct device *dev, uint8_t byte) {
     err = ps2_uart_set_mode_write(dev);
     if (err != 0) {
         LOG_ERR("Could not configure driver for write mode: %d", err);
+        /* Restore UART state — set_mode_write may have partially
+         * executed (CLK inhibited, RX stopped, diversity stopped).
+         * Without this, the UART stays in a broken state and all
+         * future writes fail, permanently freezing the TP.
+         * set_mode_read is the same recovery used by write_finish
+         * and the semaphore timeout handler — proven safe after
+         * partial set_mode_write. */
+        ps2_uart_set_mode_read(dev);
         return err;
     }
 

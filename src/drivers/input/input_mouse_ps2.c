@@ -1602,6 +1602,18 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    to be swallowed. */
     data->tp_self_reset_pending = false;
 
+    /* Reset packet buffer so bytes arriving after callback enable
+     * don't land mid-packet from stale pre-dormant state. */
+    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+
+    /* Enable the PS/2 callback before releasing CLK so the self-reset
+     * detector (0xAA 0x00) is active the instant the TP starts
+     * transmitting.  Without this, a TP self-reset during the ~10ms
+     * wake window is silently eaten (bytes go to data_queue and get
+     * purged).  Idempotent with the later enable inside
+     * activity_reporting_enable(). */
+    ps2_enable_callback(config->ps2_device);
+
     /* Transition to ACTIVE before recovery so the activity callback
      * sees the correct PM state. */
     data->pm_state = TP_PM_ACTIVE;
