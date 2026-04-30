@@ -1698,6 +1698,36 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      * and activity callback see the correct PM state. */
     data->pm_state = TP_PM_ACTIVE;
 
+    /* 4.5. Flush buffered TP movement data.
+     *
+     *    The TP was never sent F5 (disable) before dormant — it's
+     *    been accumulating movement data from noise/drift.  When CLK
+     *    goes HIGH, the TP immediately starts clocking out those
+     *    buffered bytes.  If we jump straight to verify reads, our
+     *    register read responses will be interleaved with movement
+     *    packet fragments, producing garbage values (e.g. config
+     *    returning 0xe2, sensitivity returning 255).
+     *
+     *    Fix: release CLK briefly to let the TP drain its buffer,
+     *    then re-inhibit, purge the data queue, and send F5 to
+     *    guarantee silence before verify reads. */
+    ps2_uart_release_bus(config->ps2_device);
+    k_msleep(50);
+    ps2_uart_inhibit_bus(config->ps2_device);
+    ps2_uart_data_queue_empty(config->ps2_device);
+
+    /* Send F5 (disable reporting) to stop any further movement data.
+     * activity_reporting_on is false (cleared below), so we send
+     * the raw PS/2 command directly. */
+    {
+        int f5_err = ps2_write(config->ps2_device,
+                               MOUSE_PS2_CMD_DISABLE_REPORTING[0]);
+        if (f5_err) {
+            LOG_WRN("TP idle PM: F5 disable reporting failed (%d)", f5_err);
+        }
+        ps2_uart_data_queue_empty(config->ps2_device);
+    }
+
     /* 5. Fast-path wake: verify config byte, skip full recovery if OK.
      *
      *    With the GPIO_OUTPUT_LOW CLK inhibit fix, pin transitions no
@@ -1708,8 +1738,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *      (b) TP self-reset during dormant (registers reverted).
      *
      *    Fast path (~2ms): read config byte + sensitivity → both
-     *    match → re-enable callback → done.  No F4 sent → no TARE
-     *    recalibration → no squelch → instant responsiveness.
+     *    match → send F4 → re-enable callback → done.
      *
      *    Two registers are verified to detect silent self-resets
      *    (TP reverts to factory defaults without sending 0xAA,
@@ -1742,19 +1771,9 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
 
         /* Suppress F5/F4 wrapping during verify reads.
          *
-         * activity_reporting_on is still true from before dormant
-         * (we never sent F5).  If we leave it true, send_cmd() wraps
-         * every read with F5 (disable) + F4 (enable).  F4 triggers
-         * a TARE recalibration — with the user's finger on the stick
-         * (they just moved it to wake), TARE sets zero at the current
-         * pressure → teleportation on release.
-         *
-         * By clearing the flag, send_cmd(pause_reporting=true) sees
-         * reporting is "off" and skips the F5/F4 pair.  The TP is
-         * still actually reporting (it was never sent F5), but the
-         * PS/2 half-duplex protocol ensures it won't send movement
-         * while we're sending a command.  After the read completes,
-         * we restore the flag. */
+         * We already sent F5 above to silence the TP.  Set the flag
+         * to false so send_cmd(pause_reporting=true) won't re-send
+         * F5/F4 around each register read. */
         data->activity_reporting_on = false;
 
         uint8_t config_readback;
@@ -1788,16 +1807,20 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         ps2_uart_release_bus(config->ps2_device);
 
         if (fast_ok) {
-            /* Fast path: TP is intact.  Re-enable the callback
-             * and reset the packet buffer (stale bytes may have been
-             * queued during the transition).  Restore the reporting
-             * flag — TP is still reporting (never sent F5). */
+            /* Fast path: TP is intact.  Re-enable reporting (we sent F5
+             * above to silence the TP during verify reads) and the
+             * callback.  Reset the packet buffer to discard any stale
+             * bytes queued during the flush window. */
             ps2_uart_timeslot_batch_end();
             LOG_INF("TP idle PM: fast wake (config=0x%02x, sens=%d verified)",
                     config_readback, sens_readback);
             zmk_mouse_ps2_activity_reset_packet_buffer(dev);
-            data->activity_reporting_on = true;
-            ps2_enable_callback(config->ps2_device);
+            int f4_err = zmk_mouse_ps2_activity_reporting_enable(dev);
+            if (f4_err) {
+                LOG_WRN("TP idle PM: fast wake F4 failed (%d), "
+                        "forcing callback enable", f4_err);
+                ps2_enable_callback(config->ps2_device);
+            }
         } else {
             /* Slow path: register mismatch or read failed.
              * TP may have self-reset or suffered a bus fault.

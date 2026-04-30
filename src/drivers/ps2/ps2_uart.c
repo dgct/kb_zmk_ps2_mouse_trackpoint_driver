@@ -1236,6 +1236,20 @@ static int ps2_uart_timeslot_acquire(void)
         return -ENODEV;
     }
 
+    // Wait for the session to be truly IDLE before requesting.
+    // After a timeslot ends (ACTION_END), MPSL sends SESSION_IDLE
+    // asynchronously.  Requesting before that signal returns -35.
+    for (int i = 0; i < 1000; i++) {
+        if (atomic_get(&ts_session_idle)) {
+            break;
+        }
+        k_busy_wait(10);
+    }
+    if (!atomic_get(&ts_session_idle)) {
+        LOG_WRN("MPSL session not idle after 10ms");
+        return -EBUSY;
+    }
+
     atomic_set(&ts_started, 0);
     atomic_set(&ts_blocked, 0);
     atomic_set(&ts_session_idle, 0);
@@ -1315,14 +1329,29 @@ int ps2_uart_timeslot_batch_begin(void)
 
     // Nested call — the outer batch's timeslot is still active.
     // Just bump the refcount so batch_end() knows not to release yet.
-    if (atomic_get(&ts_batch_active) > 0) {
+    // BUT: if ts_started is 0 the outer timeslot died (extension
+    // failed).  Fall through to request a fresh one.
+    if (atomic_get(&ts_batch_active) > 0 && atomic_get(&ts_started)) {
         atomic_inc(&ts_batch_active);
         return 0;
+    }
+
+    // Wait for session to be IDLE (see comment in timeslot_acquire).
+    for (int i = 0; i < 1000; i++) {
+        if (atomic_get(&ts_session_idle)) {
+            break;
+        }
+        k_busy_wait(10);
+    }
+    if (!atomic_get(&ts_session_idle)) {
+        LOG_WRN("MPSL session not idle for batch request");
+        return -EBUSY;
     }
 
     atomic_set(&ts_started, 0);
     atomic_set(&ts_blocked, 0);
     atomic_set(&ts_session_idle, 0);
+    atomic_set(&ts_batch_active, 0);
 
     // Set the TIMER0 expiry for the batch timeslot length.
     ts_current_timer_expiry_us = PS2_UART_TIMESLOT_BATCH_TIMER_EXPIRY_US;
