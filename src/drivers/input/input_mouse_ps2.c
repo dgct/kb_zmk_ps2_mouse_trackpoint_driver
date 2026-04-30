@@ -1653,25 +1653,34 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     }
     ps2_uart_data_queue_empty(config->ps2_device);
 
-    /* 5. Unconditionally re-apply all TP settings and re-enable
-     *    reporting.
+    /* 5. Re-enable reporting (F4).
      *
-     *    Since TP registers survive dormant, most writes are idempotent
-     *    (writing the same value the TP already has).  The bus is now
-     *    quiet (F5 silenced the TP), so writes should succeed without
-     *    contention from movement data. */
-
-    /* Disable reporting flag so send_cmd() skips
-     * individual F5/F4 wrapping around each register write. */
+     *    TP registers survive dormant — no need to re-apply settings.
+     *    The self-reset detector (0xAA 0x00) handles the rare case
+     *    where the TP silently resets and reverts to factory defaults;
+     *    it triggers a full recovery asynchronously.
+     *
+     *    This reduces the wake path from ~170ms of multi-byte 0xe2
+     *    extended writes (vulnerable to NACKs and SCL timeouts) to
+     *    two single-byte commands: F5 (already sent above) + F4. */
     data->activity_reporting_on = false;
 
-    int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
-    if (ret < 0) {
-        LOG_ERR("TP idle PM: wake recovery F4 failed (%d)", ret);
-    } else if (ret > 0) {
-        LOG_WRN("TP idle PM: wake recovery: %d setting(s) failed", ret);
+    int err_f4 = -EAGAIN;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        err_f4 = zmk_mouse_ps2_activity_reporting_enable(dev);
+        if (err_f4 == 0) {
+            break;
+        }
+        LOG_WRN("TP idle PM: F4 re-enable attempt %d/3 failed (%d)",
+                attempt + 1, err_f4);
+        k_msleep(5 * (attempt + 1));
+    }
+    if (err_f4) {
+        LOG_ERR("TP idle PM: all F4 attempts failed (%d), "
+                "force-enabling callback", err_f4);
+        ps2_enable_callback(config->ps2_device);
     } else {
-        LOG_INF("TP idle PM: wake recovery complete (all settings applied)");
+        LOG_INF("TP idle PM: wake complete (F5+F4, no settings re-apply)");
     }
 
     /* 6. Restart the idle timer. */
