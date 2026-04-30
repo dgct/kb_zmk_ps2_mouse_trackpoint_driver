@@ -364,6 +364,7 @@ struct zmk_mouse_ps2_data {
     struct k_work_delayable idle_pm_dormant_work;
     struct k_work_delayable idle_pm_dormant_finish_work;
     struct k_work idle_pm_wake_work;
+    struct k_work_delayable idle_pm_dormant_watchdog;
     const struct device *uart_dev;
     struct gpio_callback wake_gpio_cb;
 #endif
@@ -1474,6 +1475,39 @@ static void tp_idle_pm_wake_gpio_isr(const struct device *port,
     k_work_submit_to_queue(&tp_mgmt_wq, &data->idle_pm_wake_work);
 }
 
+/*
+ * Dormant watchdog: break the wake-GPIO deadlock.
+ *
+ * The wake mechanism relies on the TP pulling DATA low (PS/2 start bit)
+ * to fire the GPIO interrupt.  If the TP's reporting was silently
+ * disabled (bus glitch interpreted as F5, internal TP state corruption,
+ * etc.), it won't transmit when touched.  DATA stays HIGH, the GPIO
+ * never fires, and the cursor is permanently frozen.
+ *
+ * This watchdog fires a few seconds after entering DORMANT.  If we're
+ * still dormant (no GPIO wake occurred), it forces a wake cycle:
+ * resume UART, send F5+F4, restart streaming.  This breaks the
+ * deadlock regardless of root cause.
+ */
+static void tp_idle_pm_dormant_watchdog_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = (struct k_work_delayable *)work;
+    struct zmk_mouse_ps2_data *data =
+        CONTAINER_OF(dwork, struct zmk_mouse_ps2_data, idle_pm_dormant_watchdog);
+
+    if (data->pm_state != TP_PM_DORMANT) {
+        return;
+    }
+
+    LOG_WRN("TP idle PM: dormant watchdog fired — forcing wake "
+            "(no GPIO event in %d ms)",
+            CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_DORMANT_WATCHDOG_MS);
+
+    /* Reuse the normal wake path — submit the same work item.
+     * The wake handler checks pm_state == TP_PM_DORMANT, disables
+     * the GPIO, resumes UART, and sends F5+F4. */
+    k_work_submit_to_queue(&tp_mgmt_wq, &data->idle_pm_wake_work);
+}
+
 static void tp_idle_pm_dormant_finish_handler(struct k_work *work);
 
 static void tp_idle_pm_dormant_handler(struct k_work *work) {
@@ -1589,6 +1623,11 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
     ps2_uart_release_bus(config->ps2_device);
 
     data->pm_state = TP_PM_DORMANT;
+
+    /* Arm the dormant watchdog to break a potential wake-GPIO deadlock
+     * if the TP's reporting was silently disabled. */
+    k_work_schedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_watchdog,
+                              K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_DORMANT_WATCHDOG_MS));
     return;
 
 abort_dormant_resume:
@@ -1616,6 +1655,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         LOG_INF("TP idle PM: aborting dormant transition (activity during drain)");
 
         k_work_cancel_delayable(&data->idle_pm_dormant_finish_work);
+        k_work_cancel_delayable(&data->idle_pm_dormant_watchdog);
 
         err = ps2_enable_callback(config->ps2_device);
         if (err) {
@@ -1639,6 +1679,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* Cancel any pending dormant transition (both phases) */
     k_work_cancel_delayable(&data->idle_pm_dormant_work);
     k_work_cancel_delayable(&data->idle_pm_dormant_finish_work);
+    k_work_cancel_delayable(&data->idle_pm_dormant_watchdog);
 
     /* Inhibit CLK before any DATA pin transitions.  The resume
      * sequence disconnects the wake GPIO, re-enables UARTE0 pinctrl,
@@ -1793,6 +1834,8 @@ static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data) {
         if (err) {
             LOG_WRN("TP idle PM: ps2_enable_callback failed on abort (%d)", err);
         }
+
+        k_work_cancel_delayable(&data->idle_pm_dormant_watchdog);
 
         /* Restore pm_state — phase 1 set it to ENTERING_DORMANT */
         data->pm_state = TP_PM_ACTIVE;
@@ -3365,6 +3408,7 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     k_work_init_delayable(&data->idle_pm_dormant_work, tp_idle_pm_dormant_handler);
     k_work_init_delayable(&data->idle_pm_dormant_finish_work, tp_idle_pm_dormant_finish_handler);
     k_work_init(&data->idle_pm_wake_work, tp_idle_pm_wake_handler);
+    k_work_init_delayable(&data->idle_pm_dormant_watchdog, tp_idle_pm_dormant_watchdog_handler);
     data->pm_state = TP_PM_ACTIVE;
 
     /* Wire up the wake GPIO callback (interrupt is armed lazily in
