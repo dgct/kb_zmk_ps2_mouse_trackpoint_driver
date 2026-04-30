@@ -1703,145 +1703,51 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
      *    The TP was never sent F5 (disable) before dormant — it's
      *    been accumulating movement data from noise/drift.  When CLK
      *    goes HIGH, the TP immediately starts clocking out those
-     *    buffered bytes.  If we jump straight to verify reads, our
-     *    register read responses will be interleaved with movement
-     *    packet fragments, producing garbage values (e.g. config
-     *    returning 0xe2, sensitivity returning 255).
+     *    buffered bytes.  We need to drain them before issuing any
+     *    PS/2 commands.
      *
-     *    Fix: release CLK briefly to let the TP drain its buffer,
-     *    then re-inhibit, purge the data queue, and send F5 to
-     *    guarantee silence before verify reads. */
+     *    Release CLK briefly to let the TP drain its buffer,
+     *    then re-inhibit, purge the data queue. */
     ps2_uart_release_bus(config->ps2_device);
     k_msleep(50);
     ps2_uart_inhibit_bus(config->ps2_device);
     ps2_uart_data_queue_empty(config->ps2_device);
 
-    /* Send F5 (disable reporting) to stop any further movement data.
-     * activity_reporting_on is false (cleared below), so we send
-     * the raw PS/2 command directly. */
-    {
-        int f5_err = ps2_write(config->ps2_device,
-                               MOUSE_PS2_CMD_DISABLE_REPORTING[0]);
-        if (f5_err) {
-            LOG_WRN("TP idle PM: F5 disable reporting failed (%d)", f5_err);
-        }
-        ps2_uart_data_queue_empty(config->ps2_device);
-    }
-
-    /* 5. Fast-path wake: verify config byte, skip full recovery if OK.
+    /* 5. Unconditionally re-apply all TP settings and re-enable
+     *    reporting.
      *
-     *    With the GPIO_OUTPUT_LOW CLK inhibit fix, pin transitions no
-     *    longer produce spurious CLK edges.  The TP's registers should
-     *    survive dormant/wake intact.  Full recovery (~162ms + 300ms
-     *    TARE squelch) is only needed if:
-     *      (a) any register is corrupted (indicates a bus fault), or
-     *      (b) TP self-reset during dormant (registers reverted).
+     *    Previous approach tried to verify registers first (read config
+     *    byte + sensitivity) and skip recovery if they matched.  This
+     *    failed because register reads are unreliable after wake —
+     *    residual movement data (even after the 50ms flush) interleaves
+     *    with read responses, producing garbage values.  The TP keeps
+     *    generating movement data from drift/noise and clocks it out
+     *    the instant CLK goes HIGH for any PS/2 transaction.
      *
-     *    Fast path (~2ms): read config byte + sensitivity → both
-     *    match → send F4 → re-enable callback → done.
+     *    Writes are inherently more tolerant: the host drives the bus
+     *    (CLK+DATA) during writes, so movement data can't interleave.
+     *    The TP ACKs or NACKs and we retry on failure.
      *
-     *    Two registers are verified to detect silent self-resets
-     *    (TP reverts to factory defaults without sending 0xAA,
-     *    because the bus was suspended during dormant).  Config byte
-     *    alone could match by coincidence if the user's desired value
-     *    happens to equal the factory default.  Sensitivity is a
-     *    second independent check — if both match, it's extremely
-     *    unlikely the TP self-reset.
-     *
-     *    The TP was never sent F5 (disable reporting) during dormant
-     *    entry — it's still in reporting-enabled state.  We just need
-     *    to re-enable the driver-side callback. */
-    {
-        bool fast_ok = true;
+     *    Since TP registers survive dormant, most writes are idempotent
+     *    (writing the same value the TP already has).  The ~50ms cost
+     *    of unconditional apply is acceptable vs the 462ms full
+     *    recovery, and far more reliable than verify-then-recover. */
 
-        /* Acquire a batch timeslot covering both verify reads.
-         * Each read sends 2 PS/2 bytes (0xE2 + register) + reads 1
-         * response — 6+ bytes total across two registers.  Without a
-         * batch, each byte independently acquires/releases a timeslot,
-         * risking a BLE event landing between the command and response
-         * (causing a timeout → fast path failure → full 462ms recovery).
-         * A batch holds the radio for ~2-4ms — negligible vs a BLE
-         * connection interval — and matches what tp_recover_and_enable()
-         * already does for recovery writes. */
-        int batch_err = ps2_uart_timeslot_batch_begin();
-        if (batch_err) {
-            LOG_WRN("TP idle PM: batch timeslot unavailable (%d), "
-                    "using per-byte protection", batch_err);
-        }
+    /* Release CLK so PS/2 commands can flow. */
+    ps2_uart_release_bus(config->ps2_device);
 
-        /* Suppress F5/F4 wrapping during verify reads.
-         *
-         * We already sent F5 above to silence the TP.  Set the flag
-         * to false so send_cmd(pause_reporting=true) won't re-send
-         * F5/F4 around each register read. */
-        data->activity_reporting_on = false;
+    /* Disable reporting before we start writing registers.
+     * activity_reporting_on flag is set false so send_cmd() skips
+     * individual F5/F4 wrapping around each register write. */
+    data->activity_reporting_on = false;
 
-        uint8_t config_readback;
-        int config_err = zmk_mouse_ps2_tp_get_config_byte(dev, &config_readback);
-        uint8_t desired = zmk_mouse_ps2_tp_desired_config_byte(config);
-        if (config_err || config_readback != desired) {
-            LOG_WRN("TP idle PM: config byte verify failed "
-                    "(err=%d, got=0x%02x, want=0x%02x)",
-                    config_err, config_readback, desired);
-            fast_ok = false;
-        } else {
-            LOG_DBG("TP idle PM: config byte OK (0x%02x)", config_readback);
-        }
-
-        uint8_t sens_readback;
-        int sens_err = zmk_mouse_ps2_tp_sensitivity_get(dev, &sens_readback);
-        if (sens_err || sens_readback != data->tp_sensitivity) {
-            LOG_WRN("TP idle PM: sensitivity verify failed "
-                    "(err=%d, got=%d, want=%d)",
-                    sens_err, sens_readback, data->tp_sensitivity);
-            fast_ok = false;
-        } else {
-            LOG_DBG("TP idle PM: sensitivity OK (%d)", sens_readback);
-        }
-
-        /* Release CLK now that both verify reads are done.
-         * CLK was held inhibited since UART resume to prevent
-         * stale movement bytes from contaminating the data queue.
-         * Both the fast path (TP starts reporting normally) and
-         * slow path (recovery sends commands) need CLK released. */
-        ps2_uart_release_bus(config->ps2_device);
-
-        if (fast_ok) {
-            /* Fast path: TP is intact.  Re-enable reporting (we sent F5
-             * above to silence the TP during verify reads) and the
-             * callback.  Reset the packet buffer to discard any stale
-             * bytes queued during the flush window. */
-            ps2_uart_timeslot_batch_end();
-            LOG_INF("TP idle PM: fast wake (config=0x%02x, sens=%d verified)",
-                    config_readback, sens_readback);
-            zmk_mouse_ps2_activity_reset_packet_buffer(dev);
-            int f4_err = zmk_mouse_ps2_activity_reporting_enable(dev);
-            if (f4_err) {
-                LOG_WRN("TP idle PM: fast wake F4 failed (%d), "
-                        "forcing callback enable", f4_err);
-                ps2_enable_callback(config->ps2_device);
-            }
-        } else {
-            /* Slow path: register mismatch or read failed.
-             * TP may have self-reset or suffered a bus fault.
-             * Full recovery re-applies all registers + F4.
-             * activity_reporting_on is already false — recover_all
-             * expects this (skips F5/F4 per-command wrapping).
-             *
-             * Keep the batch timeslot OPEN so tp_recover_and_enable()
-             * nests into it (refcount 1→2→1) instead of ending and
-             * re-requesting — which would race with MPSL's
-             * SESSION_IDLE transition. */
-            LOG_WRN("TP idle PM: register verify failed, "
-                    "running full recovery");
-            int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
-            ps2_uart_timeslot_batch_end();
-            if (ret < 0) {
-                LOG_ERR("TP idle PM: wake recovery F4 failed (%d)", ret);
-            } else if (ret > 0) {
-                LOG_WRN("TP idle PM: wake recovery: %d setting(s) failed", ret);
-            }
-        }
+    int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
+    if (ret < 0) {
+        LOG_ERR("TP idle PM: wake recovery F4 failed (%d)", ret);
+    } else if (ret > 0) {
+        LOG_WRN("TP idle PM: wake recovery: %d setting(s) failed", ret);
+    } else {
+        LOG_INF("TP idle PM: wake recovery complete (all settings applied)");
     }
 
     /* 6. Restart the liveness watchdog and idle timer. */
