@@ -1186,7 +1186,13 @@ static mpsl_timeslot_signal_return_param_t *ps2_uart_timeslot_cb(
     case MPSL_TIMESLOT_SIGNAL_CANCELLED:
         // MPSL couldn't schedule the timeslot. Signal the polling thread
         // to fall through to an unprotected write.
+        // The session is idle after BLOCKED/CANCELLED (the request was
+        // rejected, no timeslot was started).  MPSL does NOT send
+        // SESSION_IDLE after these signals — only after ACTION_END.
+        // We must restore the idle flag here so the next acquire() can
+        // proceed.
         atomic_set(&ts_blocked, 1);
+        atomic_set(&ts_session_idle, 1);
 
         ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_NONE;
         return &ts_return_param;
