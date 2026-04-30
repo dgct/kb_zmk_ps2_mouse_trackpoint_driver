@@ -903,6 +903,13 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
     } else {
         LOG_WRN("TP self-reset recovery: all settings re-applied");
     }
+
+    /* Restart idle timer so the TP can enter dormant again after
+     * recovery.  Without this, a failed F4 on wake → recovery path
+     * would never re-arm the idle timer, preventing future dormant
+     * transitions (and their associated power savings). */
+    k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
+                                K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
 }
 
 void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
@@ -1457,6 +1464,18 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
     int err;
 
     if (data->pm_state != TP_PM_ACTIVE) {
+        return;
+    }
+
+    /* Guard: if reporting is off (F4 failed on last wake), entering
+     * dormant would deadlock — the wake GPIO relies on the TP pulling
+     * DATA low, but after F5 (sent during wake) the TP won't transmit
+     * unless F4 re-enables reporting.  Instead of freezing, escalate
+     * to full recovery (F5 + re-apply all settings + F4). */
+    if (!data->activity_reporting_on) {
+        LOG_WRN("TP idle PM: reporting off, scheduling full recovery "
+                "instead of dormant");
+        k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
         return;
     }
 

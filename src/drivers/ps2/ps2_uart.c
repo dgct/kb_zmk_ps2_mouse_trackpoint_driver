@@ -280,6 +280,7 @@ struct ps2_uart_data {
     struct k_sem write_awaits_resp_sem;
     struct k_sem write_lock;
     struct k_work_delayable write_scl_timout;
+    atomic_t write_cleanup_done;
 
     struct k_work resend_cmd_work;
 
@@ -1698,14 +1699,24 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
                 "0x%x: %d",
                 byte, err);
 
-        // Clean up stale write state — the SCL timeout or GPIO ISR
-        // may still be pending. Cancel them and restore read mode so
-        // UART RX is re-enabled. All operations are idempotent; if
-        // the ISR already ran, a stale sem give is drained by the
-        // next write_byte_start's initial k_sem_take(K_NO_WAIT).
-        k_work_cancel_delayable(&data->write_scl_timout);
+        // Clean up stale write state.  Use cancel_sync (not plain
+        // cancel) to wait for any in-flight write_scl_timeout handler
+        // on ps2_uart_work_queue to complete.  Without _sync, the
+        // handler can still be running set_mode_read concurrently
+        // with the cleanup below, corrupting UARTE1 PSEL state.
+        // Safe: this thread (tp_mgmt_wq / sysworkq) is never the
+        // same as ps2_uart_work_queue, so no deadlock.
+        struct k_work_sync write_sync;
+        k_work_cancel_delayable_sync(&data->write_scl_timout, &write_sync);
         ps2_uart_set_scl_callback_enabled(dev, false);
-        ps2_uart_set_mode_read(dev);
+
+        // Single-entry guard: if write_finish already ran (the SCL
+        // timeout handler completed before cancel_sync waited), it
+        // already did set_mode_read + sem_give.  The CAS prevents
+        // a second set_mode_read and the double sem_give.
+        if (atomic_cas(&data->write_cleanup_done, 0, 1)) {
+            ps2_uart_set_mode_read(dev);
+        }
         data->cur_write_status = PS2_UART_WRITE_STATUS_INACTIVE;
 
 #if IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION)
@@ -1748,6 +1759,11 @@ int ps2_uart_write_byte_start(const struct device *dev, uint8_t byte) {
 
         return err;
     }
+
+    /* Reset single-entry guard for this write cycle.  write_finish
+     * and the sem timeout path both CAS on this to ensure exactly
+     * one of them performs hardware cleanup (set_mode_read + sem give). */
+    atomic_set(&data->write_cleanup_done, 0);
 
     err = ps2_uart_set_mode_write(dev);
     if (err != 0) {
@@ -1966,6 +1982,16 @@ void ps2_uart_write_finish(const struct device *dev, bool successful, char *desc
         LOG_ERR("Failed to write value 0x%x: %s", data->cur_write_byte, descr);
 
         data->cur_write_status = PS2_UART_WRITE_STATUS_FAILURE;
+    }
+
+    /* Single-entry guard: only the first caller (write_finish or
+     * sem timeout) performs hardware cleanup + sem give.  The
+     * sem timeout path (caller thread) and write_scl_timeout
+     * (work queue thread) can race here — CAS ensures exactly
+     * one runs set_mode_read and gives the semaphore. */
+    if (!atomic_cas(&data->write_cleanup_done, 0, 1)) {
+        /* Another path already cleaned up — nothing to do. */
+        return;
     }
 
     err = ps2_uart_set_mode_read(dev);
