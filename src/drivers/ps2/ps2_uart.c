@@ -23,25 +23,32 @@
 #include <nrfx.h>
 
 /*
- * Dual-UARTE Diversity Receiver (#2 + #5 with δ spread)
+ * Dual-UARTE Diversity Receiver with erasure-code repair
  *
  * CLK period is measured at boot via GPIOTE+PPI+TIMER3 to auto-calibrate
  * the baud rate. UARTE0 runs at f*(1+δ) and a bare-metal UARTE1 runs at
- * f*(1-δ) on the same DATA pin. When UARTE0 gets a framing error, the
- * driver falls back to UARTE1's byte if it decoded cleanly.
+ * f*(1-δ) on the same DATA pin.  When both decode cleanly, they cross-
+ * validate; when one has a framing error, the other repairs it.
  */
 
-/* δ spread: 1/21 of center baud — the theoretical max for an
- * 11-bit UART frame with center sampling.  The last bit (stop,
- * n=10) drifts (10.5 × δ) bit periods; at δ = 1/21 this is
- * exactly 0.5 — the corruption threshold.
+/* δ spread: 1/42 of center baud — the information-theoretic
+ * optimum for a (2,1) erasure code over an 11-bit UART frame.
  *
- * fast = round(center × 22/21), slow = round(center × 20/21)
- * computed directly with rounding division to get the closest
- * integer to the exact boundary. */
-#define PS2_UART_DIVERSITY_NUMER_FAST 22U
-#define PS2_UART_DIVERSITY_NUMER_SLOW 20U
-#define PS2_UART_DIVERSITY_DENOM      21U
+ * Single-receiver corruption threshold: bit 10 (stop) drifts
+ * (10.5 × δ) bit periods; at δ = 1/21 this reaches 0.5 (limit).
+ *
+ * At δ = 1/42 (half the tiling maximum), each receiver has full
+ * 1/21 headroom.  The two valid-decode bands overlap by 50%:
+ *   - Center band |ε| < 1/42: both decode all 11 bits cleanly
+ *     → cross-validation (detect non-framing corruption)
+ *   - Extended bands 1/42 < |ε| < 1/14: exactly one receiver
+ *     valid → clean fallback, no bit-level guessing
+ *   - Total coverage: |ε| < 1/14 (3/21 of center baud)
+ *
+ * fast = round(center × 43/42), slow = round(center × 41/42) */
+#define PS2_UART_DIVERSITY_NUMER_FAST 43U
+#define PS2_UART_DIVERSITY_NUMER_SLOW 41U
+#define PS2_UART_DIVERSITY_DENOM      42U
 
 /* CLK calibration: number of edges to sample and expected tick range */
 #define PS2_UART_CAL_EDGES           16
@@ -66,6 +73,8 @@ static uint32_t diversity_err_uarte0_framing;
 static uint32_t diversity_err_uarte0_other;
 static uint32_t diversity_err_uarte1_recovered;
 static uint32_t diversity_err_both_failed;
+static uint32_t diversity_err_cross_validated;  /* both clean & agree */
+static uint32_t diversity_err_cross_mismatch;   /* both clean but disagree */
 static uint32_t diversity_byte_count;
 
 /* Calibrated baud registers */
@@ -958,28 +967,15 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
     if (err != 0) {
         const char *err_str = ps2_uart_read_get_error_str(err);
 
-        /* With δ = 1/21 the two receivers tile the TP clock range
-         * with zero overlap.  Three invariants simplify arbitration:
+        /* With δ = 1/42 the two receivers' valid-decode bands
+         * overlap by 50%.  Arbitration strategy:
          *
-         * 1. Exactly-one decoding: for any in-band TP clock, exactly
-         *    one receiver decodes correctly.  Framing error on UARTE0
-         *    means UARTE1 has the correct decode (and vice versa).
-         *
-         * 2. Framing error = reliable oracle: a framing error on one
-         *    channel guarantees the other decoded correctly.  No
-         *    ambiguous zone exists within the coverage band.
-         *
-         * 3. Data bits are always valid, even at the seam: the stop
-         *    bit (bit 10) drifts at most 0.5 bit periods at δ=1/21,
-         *    but data bits drift less (bit n drifts n·δ/2 periods).
-         *    Bit 8 (parity) drifts ~0.19 periods.  So even when the
-         *    stop bit triggers a framing error, the byte VALUE was
-         *    sampled correctly — only the framing status is unreliable.
-         *
-         * This means the arbitration is a simple mux: if UARTE0 has a
-         * framing error, use UARTE1's byte.  If both have framing
-         * errors (at the exact tiling seam, measure-zero probability),
-         * both decoded the data bits correctly — use either one. */
+         * UARTE0 framing + UARTE1 clean → UARTE1 recovered (fallback)
+         * UARTE0 framing + UARTE1 framing → outside coverage, discard
+         * UARTE0 framing + UARTE1 not ready → discard (no data bits
+         *   guaranteed valid at δ=1/42 — stop bit drift is only 0.25,
+         *   but without the second receiver we can't verify)
+         * Non-framing error → real corruption, discard */
 
         if (err == UART_ERROR_FRAMING) {
             diversity_err_uarte0_framing++;
@@ -990,7 +986,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                 uarte1_byte_ready = false;
 
                 if (u1_err == 0) {
-                    /* Normal case: UARTE1 decoded cleanly */
+                    /* Normal fallback: UARTE1 decoded cleanly */
                     diversity_err_uarte1_recovered++;
                     LOG_DBG("Diversity: UARTE1 recovered byte 0x%02x "
                             "(UARTE0 had framing for 0x%02x)",
@@ -998,17 +994,16 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                     byte = u1_byte;
                     err = 0;
                 } else if (u1_err == UART_ERROR_FRAMING) {
-                    /* Seam case: both got framing errors.  Data bits
-                     * are still valid (invariant #3) — use UARTE0's
-                     * byte value since it was sampled correctly. */
-                    diversity_err_uarte1_recovered++;
-                    LOG_DBG("Diversity: seam — both framing, using "
-                            "UARTE0 data 0x%02x", byte);
-                    err = 0;
+                    /* Both framing errors — TP clock outside the
+                     * combined coverage band.  Discard. */
+                    diversity_err_both_failed++;
+                    LOG_WRN("Diversity: both framing "
+                            "(u0=0x%02x, u1=0x%02x), discarding",
+                            byte, u1_byte);
+                    return;
                 } else {
                     /* UARTE1 has a non-framing error (parity, overrun).
-                     * This indicates real corruption, not a baud
-                     * mismatch.  Discard the byte. */
+                     * Real corruption.  Discard. */
                     diversity_err_both_failed++;
                     LOG_WRN("Diversity: both failed "
                             "(u0=0x%02x framing, u1=0x%02x %s)",
@@ -1017,13 +1012,11 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                     return;
                 }
             } else {
-                /* UARTE1 not ready — can't arbitrate.  Use UARTE0's
-                 * data value anyway (invariant #3: data bits valid
-                 * even with framing error). */
-                diversity_err_uarte1_recovered++;
-                LOG_DBG("Diversity: UARTE1 not ready, using UARTE0 "
-                        "data 0x%02x despite framing", byte);
-                err = 0;
+                /* UARTE1 not ready — can't repair.  Discard. */
+                diversity_err_both_failed++;
+                LOG_DBG("Diversity: UARTE0 framing, UARTE1 not ready, "
+                        "discarding 0x%02x", byte);
+                return;
             }
         } else {
             /* Non-framing error on UARTE0 (parity, overrun) — real
@@ -1034,6 +1027,28 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
             uarte1_byte_ready = false;
             return;
         }
+    } else if (uarte1_byte_ready) {
+        /* UARTE0 clean — cross-validate against UARTE1.
+         * In the overlap band (|ε| < 1/42), both should agree. */
+        int u1_err = ps2_uart_diversity_check_err(uarte1_last_err);
+        uint8_t u1_byte = uarte1_last_byte;
+        uarte1_byte_ready = false;
+
+        if (u1_err == 0) {
+            if (u1_byte == byte) {
+                diversity_err_cross_validated++;
+            } else {
+                /* Both decoded cleanly but disagree — indicates
+                 * non-framing corruption (bit flip, noise).
+                 * Prefer UARTE0 (primary, Zephyr-managed) but
+                 * log for telemetry. */
+                diversity_err_cross_mismatch++;
+                LOG_WRN("Diversity: cross-validation mismatch "
+                        "(u0=0x%02x, u1=0x%02x)", byte, u1_byte);
+            }
+        }
+        /* If UARTE1 had a framing error, that just means the TP
+         * clock is in the UARTE0-only band — normal, no action. */
     }
 
     // Consume UARTE1's byte even on success (stay in sync)
@@ -2401,7 +2416,7 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     }
 
     /* Compute center baud and δ-spread registers.
-     * fast = round(center × 22/21), slow = round(center × 20/21). */
+     * fast = round(center × 43/42), slow = round(center × 41/42). */
     diversity_baud_center = ps2_uart_ticks_to_baud_reg(clk_ticks);
     diversity_baud_fast = (diversity_baud_center * PS2_UART_DIVERSITY_NUMER_FAST
                            + PS2_UART_DIVERSITY_DENOM / 2)
@@ -2463,12 +2478,15 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
 static void diversity_stats_work_handler(struct k_work *work) {
     if (diversity_byte_count > 0 || diversity_err_uarte1_recovered > 0) {
         LOG_INF("Diversity stats: total=%u, u0_framing=%u, u0_other=%u, "
-                "u1_recovered=%u, both_failed=%u",
+                "u1_recovered=%u, both_failed=%u, "
+                "xval_ok=%u, xval_mismatch=%u",
                 diversity_byte_count,
                 diversity_err_uarte0_framing,
                 diversity_err_uarte0_other,
                 diversity_err_uarte1_recovered,
-                diversity_err_both_failed);
+                diversity_err_both_failed,
+                diversity_err_cross_validated,
+                diversity_err_cross_mismatch);
     }
     k_work_schedule(&diversity_stats_work,
                     K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
