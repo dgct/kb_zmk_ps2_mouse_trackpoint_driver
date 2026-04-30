@@ -14,6 +14,7 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/device.h>
 
 #include <hal/nrf_uarte.h>
 #include <hal/nrf_gpiote.h>
@@ -488,6 +489,86 @@ void ps2_uart_inhibit_bus(const struct device *dev) {
 
 void ps2_uart_release_bus(const struct device *dev) {
     ps2_uart_configure_pin_scl_input(dev);
+}
+
+/*
+ * Consolidated idle PM suspend.
+ *
+ * Stops UARTE1 diversity receiver, then suspends UARTE0 via Zephyr PM.
+ * Caller MUST have called ps2_uart_inhibit_bus() before this and
+ * MUST call ps2_uart_release_bus() when appropriate afterward.
+ *
+ * Ordering rationale:
+ *   1. diversity_stop_rx() — disables UARTE1 and disconnects PSEL.RXD
+ *      so P0.17 is free for the wake GPIO interrupt.
+ *   2. PM SUSPEND — Zephyr STOPRX + disable + sleep pinctrl on UARTE0.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+int ps2_uart_pm_suspend(const struct device *dev, const struct device *uart_dev) {
+    ps2_uart_diversity_stop_rx();
+
+    int err = pm_device_action_run(uart_dev, PM_DEVICE_ACTION_SUSPEND);
+    if (err && err != -EALREADY) {
+        LOG_WRN("ps2_uart_pm_suspend: UART suspend failed (%d)", err);
+        return err;
+    }
+
+    return 0;
+}
+
+/*
+ * Consolidated idle PM resume.
+ *
+ * Resumes UARTE0 via Zephyr PM, restores the error interrupt that PM
+ * doesn't save/restore, restarts UARTE1 diversity receiver, and purges
+ * the data queue of any stale bytes from the dormant drain window.
+ *
+ * Caller MUST have called ps2_uart_inhibit_bus() before this.
+ * CLK stays inhibited on return — both UARTEs are armed but the TP
+ * cannot transmit.  This prevents stale movement bytes from landing
+ * in the data queue before the caller can issue verify reads.
+ *
+ * Ordering rationale:
+ *   1. PM RESUME — Zephyr pinctrl DEFAULT + enable + STARTRX on UARTE0.
+ *   2. uart_irq_err_enable() — Zephyr PM doesn't save/restore error
+ *      interrupts (only ENDRX is preserved).
+ *   3. diversity_start_rx() — reconnects P0.17 to UARTE1, enables, STARTRX.
+ *   4. data_queue_empty() — purges bytes from the 5ms drain window
+ *      (phase 1 → phase 2).  CLK is inhibited so no new bytes can arrive.
+ *
+ * Retries PM RESUME up to 3 times (500µs between attempts).
+ *
+ * Returns 0 on success, negative errno if RESUME failed after all retries.
+ */
+int ps2_uart_pm_resume(const struct device *dev, const struct device *uart_dev) {
+    int err = -EAGAIN;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        err = pm_device_action_run(uart_dev, PM_DEVICE_ACTION_RESUME);
+        if (err == 0 || err == -EALREADY) {
+            break;
+        }
+        LOG_WRN("ps2_uart_pm_resume: attempt %d/3 failed (%d)", attempt + 1, err);
+        k_busy_wait(500);
+    }
+    if (err && err != -EALREADY) {
+        LOG_ERR("ps2_uart_pm_resume: failed after 3 attempts (%d)", err);
+        return err;
+    }
+
+    /* Restore UART error interrupt — Zephyr PM doesn't save/restore it */
+    uart_irq_err_enable(uart_dev);
+
+    /* Restart diversity receiver now that UARTE0 is active */
+    ps2_uart_diversity_start_rx();
+
+    /* Purge stale bytes from the data queue.  During the 5ms drain
+     * window (dormant phase 1 → phase 2), the UART was still running
+     * but the callback was disabled — any TP movement bytes went into
+     * the data queue.  CLK is inhibited so no new bytes can arrive. */
+    ps2_uart_data_queue_empty(dev);
+
+    return 0;
 }
 
 /* Diversity receiver forward declarations */

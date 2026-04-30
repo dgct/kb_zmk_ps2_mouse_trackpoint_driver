@@ -22,13 +22,10 @@
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
 #include <zephyr/drivers/uart.h>
-#include <zephyr/pm/device.h>
 #include <zmk/activity.h>
 #include <zmk/event_manager.h>
 
-/* Diversity receiver lifecycle — defined in ps2_uart.c */
-extern void ps2_uart_diversity_stop_rx(void);
-extern void ps2_uart_diversity_start_rx(void);
+/* Consolidated PM suspend/resume declared in ps2_uart_timeslot.h */
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/events/position_state_changed.h>
 
@@ -1576,14 +1573,11 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
      * controlling InvertX/InvertY/SwapXY orientation bits). */
     ps2_uart_inhibit_bus(config->ps2_device);
 
-    /* Stop diversity receiver BEFORE suspending UARTE0.
-     * UARTE1 must release P0.17 so the GPIO wake interrupt can
-     * detect the TP's start-bit falling edge during dormant. */
-    ps2_uart_diversity_stop_rx();
-
-    /* 3. Suspend the UART peripheral (applies sleep pinctrl automatically) */
-    err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_SUSPEND);
-    if (err && err != -EALREADY) {
+    /* 3. Suspend both UARTEs (diversity UARTE1 first, then UARTE0 via PM).
+     *    UARTE1 must release P0.17 so the GPIO wake interrupt can
+     *    detect the TP's start-bit falling edge during dormant. */
+    err = ps2_uart_pm_suspend(config->ps2_device, data->uart_dev);
+    if (err) {
         LOG_WRN("TP idle PM: UART suspend failed (%d)", err);
     }
 
@@ -1673,22 +1667,17 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         gpio_pin_configure_dt(&config->wake_gpio, GPIO_DISCONNECTED);
     }
 
-    /* 2. Resume the UART peripheral with retry (restores default pinctrl).
-     *    If resume fails after all attempts, stay in DORMANT to avoid an
-     *    unrecoverable broken-ACTIVE state (driver thinks it's alive but
-     *    UART is dead → no TP data → idle timer expires → dormant → wake
-     *    → fail again → infinite cycle). */
-    err = -EAGAIN;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        err = pm_device_action_run(data->uart_dev, PM_DEVICE_ACTION_RESUME);
-        if (err == 0 || err == -EALREADY) {
-            break;
-        }
-        LOG_WRN("TP idle PM: UART resume attempt %d/3 failed (%d)", attempt + 1, err);
-        k_busy_wait(500); /* 500µs between retries — short enough to not block sysworkq */
-    }
-    if (err && err != -EALREADY) {
-        LOG_ERR("TP idle PM: UART resume failed after 3 attempts (%d), staying DORMANT", err);
+    /* 2. Resume both UARTEs (UARTE0 via PM, then UARTE1 diversity).
+     *    Also restores error interrupt and purges the data queue.
+     *    CLK stays inhibited on return — both UARTEs are armed but
+     *    the TP cannot transmit, preventing stale movement bytes
+     *    from contaminating the verify reads below.
+     *
+     *    If resume fails after 3 retries, stay in DORMANT to avoid
+     *    an unrecoverable broken-ACTIVE state. */
+    err = ps2_uart_pm_resume(config->ps2_device, data->uart_dev);
+    if (err) {
+        LOG_ERR("TP idle PM: UART resume failed (%d), staying DORMANT", err);
         /* Re-arm the wake GPIO so another motion can retry. */
         if (config->has_wake_gpio) {
             gpio_pin_configure_dt(&config->wake_gpio, GPIO_INPUT);
@@ -1699,34 +1688,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         return;
     }
 
-    /* 3. Restore the UART error interrupt which the Zephyr nRF UARTE
-     *    PM driver does not save/restore across suspend/resume
-     *    (only ENDRX is preserved).  Without this, framing/parity
-     *    errors after wake are silently swallowed. */
-    uart_irq_err_enable(data->uart_dev);
-
-    /* Restart diversity receiver now that UARTE0 is active again. */
-    ps2_uart_diversity_start_rx();
-
-    /* DO NOT release CLK yet.  Both UARTEs are now listening
-     * (PM resume issued STARTRX, diversity_start_rx armed UARTE1).
-     * If we release CLK here, the TP — which was never sent F5 and
-     * still has reporting enabled — will immediately start clocking
-     * movement data.  Those bytes arrive with callback_enabled=false
-     * and go into the data queue, where they would be consumed as
-     * "responses" to the verify register reads below.
-     *
-     * By keeping CLK inhibited (GPIO_OUTPUT_LOW), the TP cannot
-     * transmit.  The first ps2_write() inside the verify reads calls
-     * set_mode_write() which also sets CLK to GPIO_OUTPUT_LOW
-     * (idempotent), then set_mode_read() releases CLK only when
-     * the TP needs to send the ACK/response — at which point
-     * write_awaits_resp is armed and the byte is routed correctly.
-     *
-     * CLK is released explicitly after the verify reads, or by the
-     * recovery path if the slow path is taken. */
-
-    /* 4. Clear stale self-reset flag to avoid misalignment.  If the TP
+    /* 3. Clear stale self-reset flag to avoid misalignment.  If the TP
      *    sent 0xAA just before suspend and we never received the 0x00,
      *    the flag would stick and cause the first real movement byte
      *    to be swallowed. */
@@ -1735,13 +1697,6 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* Transition to ACTIVE before recovery so the watchdog handler
      * and activity callback see the correct PM state. */
     data->pm_state = TP_PM_ACTIVE;
-
-    /* Purge stale bytes from the PS/2 data queue.  During the 5ms
-     * drain window (phase 1 → phase 2), the UART was still running
-     * but the callback was disabled — any movement bytes the TP sent
-     * went into the data queue.  CLK is still inhibited here so no
-     * new bytes can arrive during the purge. */
-    ps2_uart_data_queue_empty(config->ps2_device);
 
     /* 5. Fast-path wake: verify config byte, skip full recovery if OK.
      *
@@ -1810,6 +1765,8 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
                     "(err=%d, got=0x%02x, want=0x%02x)",
                     config_err, config_readback, desired);
             fast_ok = false;
+        } else {
+            LOG_DBG("TP idle PM: config byte OK (0x%02x)", config_readback);
         }
 
         uint8_t sens_readback;
@@ -1819,6 +1776,8 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
                     "(err=%d, got=%d, want=%d)",
                     sens_err, sens_readback, data->tp_sensitivity);
             fast_ok = false;
+        } else {
+            LOG_DBG("TP idle PM: sensitivity OK (%d)", sens_readback);
         }
 
         ps2_uart_timeslot_batch_end();

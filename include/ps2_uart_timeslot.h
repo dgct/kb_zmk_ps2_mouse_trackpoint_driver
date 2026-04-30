@@ -75,3 +75,37 @@ void ps2_uart_release_bus(const struct device *dev);
  * @param dev  The PS/2 UART device (e.g. config->ps2_device).
  */
 void ps2_uart_data_queue_empty(const struct device *dev);
+
+/**
+ * Consolidated idle PM suspend for both UARTEs.
+ *
+ * Stops UARTE1 diversity receiver (disconnects P0.17 for wake GPIO),
+ * then suspends UARTE0 via Zephyr PM (STOPRX + disable + sleep pinctrl).
+ *
+ * Caller MUST call ps2_uart_inhibit_bus() BEFORE this function, and
+ * ps2_uart_release_bus() when appropriate afterward.
+ *
+ * @param dev       The PS/2 UART device.
+ * @param uart_dev  The underlying Zephyr UART device (for PM action).
+ * @return 0 on success, negative errno on failure.
+ */
+int ps2_uart_pm_suspend(const struct device *dev, const struct device *uart_dev);
+
+/**
+ * Consolidated idle PM resume for both UARTEs.
+ *
+ * Resumes UARTE0 via Zephyr PM (pinctrl DEFAULT + enable + STARTRX),
+ * restores the error interrupt, restarts UARTE1 diversity receiver,
+ * and purges the data queue.
+ *
+ * CLK stays inhibited on return — both UARTEs are armed but the TP
+ * cannot transmit, preventing stale bytes from contaminating verify reads.
+ * Caller MUST call ps2_uart_inhibit_bus() BEFORE this function.
+ *
+ * Retries PM RESUME up to 3 times with 500µs between attempts.
+ *
+ * @param dev       The PS/2 UART device.
+ * @param uart_dev  The underlying Zephyr UART device (for PM action).
+ * @return 0 on success, negative errno if all resume attempts failed.
+ */
+int ps2_uart_pm_resume(const struct device *dev, const struct device *uart_dev);
