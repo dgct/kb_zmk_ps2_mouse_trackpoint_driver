@@ -1019,6 +1019,10 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
 
             return;
         }
+
+        // Non-ACK byte consumed as write response AND falls through
+        // to data_queue — log this rare but important case.
+        LOG_WRN("write_awaits_resp got non-ACK 0x%02x — falls through", byte);
     }
 
     // If no callback is set, we add the data to a fifo queue
@@ -1033,6 +1037,8 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
         }
         k_work_submit_to_queue(&ps2_uart_work_queue_cb, &data->callback_work);
     } else {
+        LOG_WRN("data_queue <-- 0x%02x (awaits_resp=%d, cb_en=%d)",
+                byte, data->write_awaits_resp, data->callback_enabled);
         ps2_uart_data_queue_add(dev, byte);
     }
 }
