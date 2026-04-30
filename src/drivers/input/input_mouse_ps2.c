@@ -915,12 +915,21 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
 
     /* Post-TARE movement squelch: drop the first few packets after
      * F4.  TARE completes within ~1 packet at 200Hz; we drop 3 for
-     * margin.  Clicks still pass through. */
+     * margin.  Clicks still pass through.
+     *
+     * On the last squelched packet (count → 0), also reset prev_packet
+     * so the delta check doesn't false-positive on the first real
+     * packet.  Without this, a user pressing at 80 counts during wake
+     * produces x_delta=80 against the zeroed prev, exceeding the 75
+     * threshold and getting incorrectly rejected as corruption. */
     if (data->tare_squelch_packets > 0) {
         data->tare_squelch_packets--;
         packet.mov_x = 0;
         packet.mov_y = 0;
         packet.scroll = 0;
+        if (data->tare_squelch_packets == 0) {
+            data->prev_packet = packet;
+        }
     }
 
     int x_delta = abs(data->prev_packet.mov_x - packet.mov_x);
@@ -946,7 +955,18 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
     // a mistransmission or misalignment.
     // But we only do this check if there was prior movement that wasn't
     // reset in `zmk_mouse_ps2_activity_packet_timout`.
-    if ((packet.mov_x != 0 && packet.mov_y != 0) && (x_delta > 150 || y_delta > 150)) {
+    //
+    // Threshold derivation (200 Hz):
+    //   Human finger bandwidth on TP ≈ 10 Hz.  Peak slew of a
+    //   10 Hz sinusoid with amplitude A = sensitivity/128 × 100:
+    //     2π·10·A per second → π·A/10 per 5ms sample.
+    //   Diagonal (both-axes gate): per-axis = ×1/√2.
+    //   3× margin:  threshold = 3·π/(10·√2) · A ≈ 0.52 × sensitivity.
+    //   Integer: sensitivity × 13 / 25.
+    //   At sens=128: 66.  At sens=255: 132.  Corruption floor ≈ 200+.
+    int movement_threshold = MAX(((int)data->tp_sensitivity * 13) / 25, 50);
+    if ((packet.mov_x != 0 && packet.mov_y != 0) &&
+        (x_delta > movement_threshold || y_delta > movement_threshold)) {
         LOG_WRN("Detected malformed packet with "
                 "(mov_x=%d, mov_y=%d, o_x=%d, o_y=%d, scroll=%d, "
                 "b_l=%d, b_m=%d, b_r=%d) and ("
