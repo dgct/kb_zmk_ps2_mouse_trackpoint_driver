@@ -1758,6 +1758,21 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     {
         bool fast_ok = true;
 
+        /* Acquire a batch timeslot covering both verify reads.
+         * Each read sends 2 PS/2 bytes (0xE2 + register) + reads 1
+         * response — 6+ bytes total across two registers.  Without a
+         * batch, each byte independently acquires/releases a timeslot,
+         * risking a BLE event landing between the command and response
+         * (causing a timeout → fast path failure → full 462ms recovery).
+         * A batch holds the radio for ~2-4ms — negligible vs a BLE
+         * connection interval — and matches what tp_recover_and_enable()
+         * already does for recovery writes. */
+        int batch_err = ps2_uart_timeslot_batch_begin();
+        if (batch_err) {
+            LOG_WRN("TP idle PM: batch timeslot unavailable (%d), "
+                    "using per-byte protection", batch_err);
+        }
+
         /* Suppress F5/F4 wrapping during verify reads.
          *
          * activity_reporting_on is still true from before dormant
@@ -1793,6 +1808,8 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
                     sens_err, sens_readback, data->tp_sensitivity);
             fast_ok = false;
         }
+
+        ps2_uart_timeslot_batch_end();
 
         if (fast_ok) {
             /* Fast path: TP is intact.  Re-enable the callback
