@@ -319,6 +319,7 @@ static struct k_work_q ps2_uart_work_queue_cb;
 static atomic_t ts_started = ATOMIC_INIT(0);
 static atomic_t ts_blocked = ATOMIC_INIT(0);
 static atomic_t ts_force_end = ATOMIC_INIT(0);
+static atomic_t ts_session_idle = ATOMIC_INIT(1);
 
 // Batch refcount: when > 0, write_byte_blocking() skips per-byte
 // timeslot acquire/release and relies on the batch timeslot.
@@ -1190,6 +1191,13 @@ static mpsl_timeslot_signal_return_param_t *ps2_uart_timeslot_cb(
         ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_NONE;
         return &ts_return_param;
 
+    case MPSL_TIMESLOT_SIGNAL_SESSION_IDLE:
+        // Session is truly idle — safe to call mpsl_timeslot_request().
+        atomic_set(&ts_session_idle, 1);
+        // Return value is ignored for SESSION_IDLE.
+        ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_NONE;
+        return &ts_return_param;
+
     default:
         ts_return_param.callback_action = MPSL_TIMESLOT_SIGNAL_ACTION_NONE;
         return &ts_return_param;
@@ -1230,6 +1238,7 @@ static int ps2_uart_timeslot_acquire(void)
 
     atomic_set(&ts_started, 0);
     atomic_set(&ts_blocked, 0);
+    atomic_set(&ts_session_idle, 0);
 
     // Set the TIMER0 expiry for the per-byte timeslot length
     // before requesting — the signal handler reads this on START.
@@ -1238,6 +1247,7 @@ static int ps2_uart_timeslot_acquire(void)
     err = mpsl_timeslot_request(ts_session_id, &ts_request_earliest);
     if (err) {
         LOG_WRN("MPSL timeslot request failed: %d", err);
+        atomic_set(&ts_session_idle, 1);
         return -EBUSY;
     }
 
@@ -1260,25 +1270,37 @@ static int ps2_uart_timeslot_acquire(void)
 }
 
 // Mark that we're done with the timeslot. TIMER0 will end it naturally.
-static void ps2_uart_timeslot_release(void)
+static void ps2_uart_timeslot_end_and_wait(void)
 {
-    // Tell the signal handler to return ACTION_END unconditionally,
-    // even if batch_active > 0 (we're releasing a per-byte timeslot
-    // that was acquired because the batch timeslot expired).
-    atomic_set(&ts_force_end, 1);
-
-    // Force TIMER0 to fire immediately so MPSL returns ACTION_END.
-    nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0, 1);
+    // Capture current TIMER0 counter and set CC0 just ahead of it.
+    // Setting CC0=1 doesn't work because the counter has already
+    // passed 1 (it's at ~37000µs for a batch).  COMPARE0 only fires
+    // when the counter REACHES the CC value, not when it's past it.
+    nrf_timer_task_trigger(MPSL_TIMER0, NRF_TIMER_TASK_CAPTURE1);
+    uint32_t now = nrf_timer_cc_get(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL1);
+    nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0, now + 1);
     nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
 
-    for (int i = 0; i < 200; i++) {
-        if (!atomic_get(&ts_started)) {
+    // Wait for MPSL to end the timeslot AND signal SESSION_IDLE.
+    // ts_started goes to 0 when the signal handler returns ACTION_END.
+    // ts_session_idle goes to 1 when MPSL sends SIGNAL_SESSION_IDLE.
+    // Only after SESSION_IDLE is mpsl_timeslot_request() safe to call.
+    for (int i = 0; i < 1000; i++) {
+        if (atomic_get(&ts_session_idle)) {
             break;
         }
         k_busy_wait(10);
     }
     atomic_set(&ts_started, 0);
     atomic_set(&ts_force_end, 0);
+}
+
+static void ps2_uart_timeslot_release(void)
+{
+    // Tell the signal handler to return ACTION_END unconditionally,
+    // even if batch_active > 0.
+    atomic_set(&ts_force_end, 1);
+    ps2_uart_timeslot_end_and_wait();
 }
 
 // --- Batch timeslot API (exposed via ps2_uart_timeslot.h) ---
@@ -1300,6 +1322,7 @@ int ps2_uart_timeslot_batch_begin(void)
 
     atomic_set(&ts_started, 0);
     atomic_set(&ts_blocked, 0);
+    atomic_set(&ts_session_idle, 0);
 
     // Set the TIMER0 expiry for the batch timeslot length.
     ts_current_timer_expiry_us = PS2_UART_TIMESLOT_BATCH_TIMER_EXPIRY_US;
@@ -1307,6 +1330,7 @@ int ps2_uart_timeslot_batch_begin(void)
     err = mpsl_timeslot_request(ts_session_id, &ts_request_batch);
     if (err) {
         LOG_WRN("MPSL batch timeslot request failed: %d", err);
+        atomic_set(&ts_session_idle, 1);
         return -EBUSY;
     }
 
@@ -1345,27 +1369,8 @@ void ps2_uart_timeslot_batch_end(void)
     // ACTION_END instead of requesting an extension.
     atomic_set(&ts_batch_active, 0);
 
-    // Force TIMER0 to fire immediately by setting CC0 to 1µs.
-    // This makes the signal handler run promptly with SIGNAL_TIMER0,
-    // which (with batch_active=0) returns ACTION_END.
-    // Without this, the timeslot stays active for up to 99.5ms,
-    // blocking all subsequent mpsl_timeslot_request() with -35.
-    nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0, 1);
-    nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
-
-    // Wait for MPSL to actually end the timeslot.
-    // The signal handler sets ts_started=0 when it returns ACTION_END.
-    // Timeout after 5ms as a safety net (TIMER0 should fire within ~1µs).
-    for (int i = 0; i < 500; i++) {
-        if (!atomic_get(&ts_started)) {
-            break;
-        }
-        k_busy_wait(10);
-    }
-
-    // Even if the wait timed out, clear ts_started so callers don't
-    // think a timeslot is still active.
-    atomic_set(&ts_started, 0);
+    // End the timeslot properly and wait for SESSION_IDLE.
+    ps2_uart_timeslot_end_and_wait();
     LOG_INF("MPSL batch timeslot released");
 }
 

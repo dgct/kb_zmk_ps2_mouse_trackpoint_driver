@@ -1780,8 +1780,6 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
             LOG_DBG("TP idle PM: sensitivity OK (%d)", sens_readback);
         }
 
-        ps2_uart_timeslot_batch_end();
-
         /* Release CLK now that both verify reads are done.
          * CLK was held inhibited since UART resume to prevent
          * stale movement bytes from contaminating the data queue.
@@ -1794,6 +1792,7 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
              * and reset the packet buffer (stale bytes may have been
              * queued during the transition).  Restore the reporting
              * flag — TP is still reporting (never sent F5). */
+            ps2_uart_timeslot_batch_end();
             LOG_INF("TP idle PM: fast wake (config=0x%02x, sens=%d verified)",
                     config_readback, sens_readback);
             zmk_mouse_ps2_activity_reset_packet_buffer(dev);
@@ -1804,10 +1803,16 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
              * TP may have self-reset or suffered a bus fault.
              * Full recovery re-applies all registers + F4.
              * activity_reporting_on is already false — recover_all
-             * expects this (skips F5/F4 per-command wrapping). */
+             * expects this (skips F5/F4 per-command wrapping).
+             *
+             * Keep the batch timeslot OPEN so tp_recover_and_enable()
+             * nests into it (refcount 1→2→1) instead of ending and
+             * re-requesting — which would race with MPSL's
+             * SESSION_IDLE transition. */
             LOG_WRN("TP idle PM: register verify failed, "
                     "running full recovery");
             int ret = zmk_mouse_ps2_tp_recover_and_enable(dev);
+            ps2_uart_timeslot_batch_end();
             if (ret < 0) {
                 LOG_ERR("TP idle PM: wake recovery F4 failed (%d)", ret);
             } else if (ret > 0) {
