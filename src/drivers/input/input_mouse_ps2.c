@@ -1641,8 +1641,9 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         /* F5 failed — fall back to the old flush strategy. */
         k_msleep(50);
     } else {
-        /* F5 succeeded — short drain for any in-flight bytes. */
-        k_msleep(5);
+        /* F5 succeeded — short drain for any in-flight bytes.
+         * One PS/2 frame = 743µs at 14.8kHz; 1ms gives 35% margin. */
+        k_msleep(1);
     }
     ps2_uart_data_queue_empty(config->ps2_device);
 
@@ -1675,6 +1676,13 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     } else {
         LOG_INF("TP idle PM: wake complete (F5+F4, no settings re-apply)");
     }
+
+    /* Arm the post-TARE movement squelch.  F4 triggers a TARE
+     * recalibration — if the user's finger is on the stick (which
+     * it is, since that's what fired the wake GPIO), the old-to-new
+     * baseline delta gets reported as one large movement packet.
+     * Suppress movement (not clicks) for 300ms. */
+    data->tare_squelch_until = k_uptime_get() + 300;
 
     /* 6. Restart the idle timer. */
 
