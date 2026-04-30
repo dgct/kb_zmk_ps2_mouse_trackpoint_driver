@@ -72,6 +72,16 @@ static uint32_t diversity_baud_center;
 static uint32_t diversity_baud_fast;
 static uint32_t diversity_baud_slow;
 
+/* Saved UARTE0 DMA config (captured at init, restored after reset) */
+static uint32_t uarte0_rxd_ptr;
+static uint32_t uarte0_rxd_maxcnt;
+
+/* Deferred CLK calibration */
+static const struct device *cal_dev;   /* set once during init */
+static void ps2_uart_deferred_cal_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(deferred_cal_work, ps2_uart_deferred_cal_handler);
+#define PS2_UART_DEFERRED_CAL_DELAY_MS 2000
+
 /* Periodic stats logging */
 static void diversity_stats_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(diversity_stats_work, diversity_stats_work_handler);
@@ -607,9 +617,10 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
     ps2_uart_set_scl_callback_enabled(dev, false);
 
     // Re-arm UARTE DMA for receiving the next byte.
-    // STOPRX was issued in set_mode_write() before disconnecting the pin.
-    // PTR/MAXCNT registers survive STOPRX (only cleared by peripheral
-    // disable/enable), so no need to call nrf_uarte_rx_buffer_set().
+    // If STOPRX timed out in set_mode_write(), the UARTE was fully
+    // reset (disable/enable) and PTR/MAXCNT were restored there.
+    // If STOPRX succeeded normally, PTR/MAXCNT survive STOPRX.
+    // Either way, DMA config is valid — just clear stale events.
     nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_ENDRX);
 
     // Clear any stale ERRORSRC bits left over from a previous framing
@@ -669,7 +680,19 @@ static int ps2_uart_set_mode_write(const struct device *dev) {
             timeout_us -= 2;
         }
         if (timeout_us <= 0) {
-            LOG_WRN("STOPRX: timed out waiting for RXTO");
+            /* STOPRX failed — CLK is inhibited so the UARTE is stuck
+             * mid-byte with no more clock edges to finish.  The only
+             * way to guarantee a clean state machine is a full
+             * disable/enable cycle.  This resets all internal FIFO
+             * and DMA state.  We restore RXD.PTR/MAXCNT (cleared by
+             * the cycle) so set_mode_read()'s STARTRX works. */
+            LOG_WRN("STOPRX: timed out — resetting UARTE0");
+            uint32_t saved_baud = NRF_UARTE0->BAUDRATE;
+            nrf_uarte_disable(NRF_UARTE0);
+            nrf_uarte_enable(NRF_UARTE0);
+            NRF_UARTE0->BAUDRATE = saved_baud;
+            NRF_UARTE0->RXD.PTR = uarte0_rxd_ptr;
+            NRF_UARTE0->RXD.MAXCNT = uarte0_rxd_maxcnt;
         }
 
         nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_RXSTARTED);
@@ -2175,92 +2198,23 @@ ISR_DIRECT_DECLARE(uarte1_diversity_isr) {
 }
 
 /**
- * Initialize the diversity receiver: calibrate CLK, configure UARTE1.
- * Called from ps2_uart_init_uart() after Zephyr's UARTE0 is configured.
+ * Initialize the diversity receiver: schedule deferred CLK calibration.
+ *
+ * At boot the TP hasn't started streaming yet, so there are no CLK edges
+ * to measure.  We start with the hardcoded CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG
+ * (the empirically-proven "magic number") and schedule a calibration attempt
+ * for T+2s, by which time the TP is streaming movement data and CLK edges
+ * are plentiful.
+ *
+ * If the deferred calibration succeeds, it computes the center baud from
+ * measured CLK period, derives the fast/slow δ-spread registers, configures
+ * UARTE1, and updates UARTE0's BAUDRATE.
  */
 static int ps2_uart_diversity_init(const struct device *dev) {
-    /* Phase 1: Measure CLK period */
-    uint32_t clk_ticks = ps2_uart_calibrate_clk_period(dev);
-    if (clk_ticks == 0) {
-        LOG_WRN("Diversity: CLK calibration failed, using hardcoded baud");
-        /* Fall back to the existing CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG */
-        return -ENODATA;
-    }
-
-    /* Compute center baud and δ-spread registers.
-     * fast = round(center × 22/21), slow = round(center × 20/21).
-     * Rounding division: (a + d/2) / d, computed directly to avoid
-     * truncation error from an intermediate delta. */
-    diversity_baud_center = ps2_uart_ticks_to_baud_reg(clk_ticks);
-    diversity_baud_fast = (diversity_baud_center * PS2_UART_DIVERSITY_NUMER_FAST
-                           + PS2_UART_DIVERSITY_DENOM / 2)
-                          / PS2_UART_DIVERSITY_DENOM;
-    diversity_baud_slow = (diversity_baud_center * PS2_UART_DIVERSITY_NUMER_SLOW
-                           + PS2_UART_DIVERSITY_DENOM / 2)
-                          / PS2_UART_DIVERSITY_DENOM;
-
-    LOG_INF("Diversity: center=0x%08x, fast(%d/%d)=0x%08x, slow(%d/%d)=0x%08x",
-            diversity_baud_center,
-            PS2_UART_DIVERSITY_NUMER_FAST, PS2_UART_DIVERSITY_DENOM,
-            diversity_baud_fast,
-            PS2_UART_DIVERSITY_NUMER_SLOW, PS2_UART_DIVERSITY_DENOM,
-            diversity_baud_slow);
-
-    /* Apply fast baud to UARTE0 (primary) */
-    NRF_UARTE0->BAUDRATE = diversity_baud_fast;
-    LOG_INF("Diversity: UARTE0 BAUDRATE set to 0x%08x (fast)", diversity_baud_fast);
-
-    /* Phase 2: Configure UARTE1 (bare-metal, slow baud) */
-    nrf_uarte_enable(NRF_UARTE1);  /* Must enable briefly to reset state */
-    nrf_uarte_disable(NRF_UARTE1);
-
-    /* Pin select: RXD = P0.17 (same as UARTE0), all others disconnected */
-    NRF_UARTE1->PSEL.RXD = 17;                /* P0.17 */
-    NRF_UARTE1->PSEL.TXD = NRF_UARTE_PSEL_DISCONNECTED;
-    NRF_UARTE1->PSEL.CTS = NRF_UARTE_PSEL_DISCONNECTED;
-    NRF_UARTE1->PSEL.RTS = NRF_UARTE_PSEL_DISCONNECTED;
-
-    /* CONFIG: 8 data bits, even parity (0x7 << 1 = 0x0E), no HWFC */
-    NRF_UARTE1->CONFIG = 0x0E;
-
-    /* Baud rate: slow (f - δ) */
-    NRF_UARTE1->BAUDRATE = diversity_baud_slow;
-
-    /* DMA: 1-byte receive buffer */
-    NRF_UARTE1->RXD.PTR = (uint32_t)&uarte1_dma_buf;
-    NRF_UARTE1->RXD.MAXCNT = 1;
-
-    /* Enable UARTE1 */
-    nrf_uarte_enable(NRF_UARTE1);
-
-    /* Clear stale state */
-    NRF_UARTE1->ERRORSRC = 0x0F;  /* W1C all error flags */
-    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
-    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
-    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXTO);
-    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXSTARTED);
-
-    /* Enable ENDRX + ERROR interrupts */
-    nrf_uarte_int_enable(NRF_UARTE1,
-                         NRF_UARTE_INT_ENDRX_MASK | NRF_UARTE_INT_ERROR_MASK);
-
-    /* Register bare-metal ISR and enable in NVIC */
-    IRQ_DIRECT_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_UARTE1), 1,
-                       uarte1_diversity_isr, 0);
-    irq_enable(NRFX_IRQ_NUMBER_GET(NRF_UARTE1));
-
-    /* Start receiving */
-    uarte1_byte_ready = false;
-    nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
-
-    uarte1_initialized = true;
-    LOG_INF("Diversity: UARTE1 initialized at 0x%08x (slow), ISR registered",
-            diversity_baud_slow);
-
-    /* Start periodic stats logging */
-    k_work_schedule(&diversity_stats_work,
-                    K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
-
+    cal_dev = dev;
+    LOG_INF("Diversity: using hardcoded baud, deferred calibration in %d ms",
+            PS2_UART_DEFERRED_CAL_DELAY_MS);
+    k_work_schedule(&deferred_cal_work, K_MSEC(PS2_UART_DEFERRED_CAL_DELAY_MS));
     return 0;
 }
 
@@ -2348,6 +2302,86 @@ static int ps2_uart_diversity_check_err(uint32_t errorsrc) {
         return UART_BREAK;
     }
     return 0;  /* No error */
+}
+
+/**
+ * Deferred CLK calibration work handler.
+ *
+ * Runs ~2s after boot when the TP is streaming and CLK edges are available.
+ * Measures CLK period, computes optimal BAUDRATE, and optionally brings up
+ * the UARTE1 diversity receiver.
+ */
+static void ps2_uart_deferred_cal_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (cal_dev == NULL) {
+        return;
+    }
+
+    uint32_t old_baud = NRF_UARTE0->BAUDRATE;
+
+    uint32_t clk_ticks = ps2_uart_calibrate_clk_period(cal_dev);
+    if (clk_ticks == 0) {
+        LOG_WRN("Deferred calibration: no CLK edges, keeping baud 0x%08x",
+                old_baud);
+        return;
+    }
+
+    /* Compute center baud and δ-spread registers.
+     * fast = round(center × 22/21), slow = round(center × 20/21). */
+    diversity_baud_center = ps2_uart_ticks_to_baud_reg(clk_ticks);
+    diversity_baud_fast = (diversity_baud_center * PS2_UART_DIVERSITY_NUMER_FAST
+                           + PS2_UART_DIVERSITY_DENOM / 2)
+                          / PS2_UART_DIVERSITY_DENOM;
+    diversity_baud_slow = (diversity_baud_center * PS2_UART_DIVERSITY_NUMER_SLOW
+                           + PS2_UART_DIVERSITY_DENOM / 2)
+                          / PS2_UART_DIVERSITY_DENOM;
+
+    LOG_INF("Deferred cal: center=0x%08x, fast=0x%08x, slow=0x%08x "
+            "(was 0x%08x)",
+            diversity_baud_center, diversity_baud_fast,
+            diversity_baud_slow, old_baud);
+
+    /* Apply calibrated fast baud to UARTE0 */
+    NRF_UARTE0->BAUDRATE = diversity_baud_fast;
+    LOG_INF("Deferred cal: UARTE0 BAUDRATE 0x%08x → 0x%08x",
+            old_baud, diversity_baud_fast);
+
+    /* Bring up UARTE1 diversity receiver with the slow baud */
+    nrf_uarte_enable(NRF_UARTE1);
+    nrf_uarte_disable(NRF_UARTE1);
+
+    NRF_UARTE1->PSEL.RXD = 17;
+    NRF_UARTE1->PSEL.TXD = NRF_UARTE_PSEL_DISCONNECTED;
+    NRF_UARTE1->PSEL.CTS = NRF_UARTE_PSEL_DISCONNECTED;
+    NRF_UARTE1->PSEL.RTS = NRF_UARTE_PSEL_DISCONNECTED;
+    NRF_UARTE1->CONFIG = 0x0E;
+    NRF_UARTE1->BAUDRATE = diversity_baud_slow;
+    NRF_UARTE1->RXD.PTR = (uint32_t)&uarte1_dma_buf;
+    NRF_UARTE1->RXD.MAXCNT = 1;
+
+    nrf_uarte_enable(NRF_UARTE1);
+    NRF_UARTE1->ERRORSRC = 0x0F;
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXTO);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXSTARTED);
+
+    nrf_uarte_int_enable(NRF_UARTE1,
+                         NRF_UARTE_INT_ENDRX_MASK | NRF_UARTE_INT_ERROR_MASK);
+    IRQ_DIRECT_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_UARTE1), 1,
+                       uarte1_diversity_isr, 0);
+    irq_enable(NRFX_IRQ_NUMBER_GET(NRF_UARTE1));
+
+    uarte1_byte_ready = false;
+    nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
+    uarte1_initialized = true;
+
+    LOG_INF("Deferred cal: UARTE1 diversity receiver up at 0x%08x",
+            diversity_baud_slow);
+
+    k_work_schedule(&diversity_stats_work,
+                    K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
 }
 
 /**
@@ -2502,9 +2536,14 @@ static int ps2_uart_init_uart(const struct device *dev) {
     LOG_INF("Overrode UARTE BAUDRATE register to 0x%08x", CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG);
 #endif
 
-    /* Initialize dual-UARTE diversity receiver.
-     * Calibrates CLK period, sets UARTE0 to f+δ and UARTE1 to f-δ.
-     * On failure, falls through to use the existing baud rate. */
+    /* Save UARTE0 DMA config — needed to restore after disable/enable
+     * reset cycles in set_mode_write()'s STOPRX timeout handler. */
+    uarte0_rxd_ptr = NRF_UARTE0->RXD.PTR;
+    uarte0_rxd_maxcnt = NRF_UARTE0->RXD.MAXCNT;
+
+    /* Schedule deferred CLK calibration + diversity receiver bring-up.
+     * At boot the TP isn't streaming yet, so we start with the hardcoded
+     * baud and calibrate once CLK edges are available (~2s). */
     err = ps2_uart_diversity_init(dev);
     if (err != 0) {
         LOG_WRN("Diversity init failed (%d), running single-UARTE mode", err);
