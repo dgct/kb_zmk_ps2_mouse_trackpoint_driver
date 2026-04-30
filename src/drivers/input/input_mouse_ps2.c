@@ -873,6 +873,9 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
  * retries to 0 and the watchdog returns to the normal 5s cadence.
  */
 static void zmk_mouse_ps2_liveness_watchdog_handler(struct k_work *work) {
+    /* XXX: disabled for testing — isolate watchdog as rotation source */
+    return;
+
     struct k_work_delayable *dwork = (struct k_work_delayable *)work;
     struct zmk_mouse_ps2_data *data = CONTAINER_OF(dwork, struct zmk_mouse_ps2_data,
                                                    liveness_watchdog);
