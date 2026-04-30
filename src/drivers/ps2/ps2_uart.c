@@ -556,10 +556,6 @@ int ps2_uart_pm_resume(const struct device *dev, const struct device *uart_dev) 
         return err;
     }
 
-    /* Diagnostic: verify UARTE0 CONFIG & BAUDRATE survive PM cycle */
-    LOG_WRN("PM resume: CONFIG=0x%08x BAUDRATE=0x%08x ENABLE=0x%08x",
-            NRF_UARTE0->CONFIG, NRF_UARTE0->BAUDRATE, NRF_UARTE0->ENABLE);
-
     /* Restore UART error interrupt — Zephyr PM doesn't save/restore it */
     uart_irq_err_enable(uart_dev);
 
@@ -671,8 +667,7 @@ static int ps2_uart_set_mode_write(const struct device *dev) {
             timeout_us -= 2;
         }
         if (timeout_us <= 0) {
-            LOG_WRN("STOPRX: timed out waiting for RXTO (CONFIG=0x%08x ENABLE=0x%08x)",
-                    NRF_UARTE0->CONFIG, NRF_UARTE0->ENABLE);
+            LOG_WRN("STOPRX: timed out waiting for RXTO");
         }
 
         nrf_uarte_event_clear(NRF_UARTE0, NRF_UARTE_EVENT_RXSTARTED);
@@ -891,9 +886,6 @@ void ps2_uart_read_interrupt_handler(const struct device *uart_dev, void *user_d
 static int ps2_uart_read_err_check(const struct device *dev) {
     // TOOD: Make this function only work if nrf52 is used
     int err = uart_err_check(dev);
-
-    /* Diagnostic: raw ERRORSRC value (already consumed by uart_err_check) */
-    LOG_WRN("err_check: raw=0x%02x CONFIG=0x%08x", err, NRF_UARTE0->CONFIG);
 
     // In the config we enabled even parity, because nrf52 does
     // not support odd parity.
@@ -1267,6 +1259,18 @@ static int ps2_uart_timeslot_acquire(void)
 // Mark that we're done with the timeslot. TIMER0 will end it naturally.
 static void ps2_uart_timeslot_release(void)
 {
+    // Force TIMER0 to fire immediately so MPSL returns ACTION_END.
+    // Without this, the timeslot stays active and blocks subsequent
+    // mpsl_timeslot_request() with -35.
+    nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0, 1);
+    nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
+
+    for (int i = 0; i < 200; i++) {
+        if (!atomic_get(&ts_started)) {
+            break;
+        }
+        k_busy_wait(10);
+    }
     atomic_set(&ts_started, 0);
 }
 
@@ -1330,10 +1334,30 @@ void ps2_uart_timeslot_batch_end(void)
     }
 
     // Outermost batch_end — release the timeslot.
+    // Clear batch_active FIRST so the next TIMER0 expiry returns
+    // ACTION_END instead of requesting an extension.
     atomic_set(&ts_batch_active, 0);
-    // Clear ts_started so that any per-byte code that runs later
-    // doesn't think a timeslot is still active.  The MPSL TIMER0
-    // will formally end the timeslot when it fires.
+
+    // Force TIMER0 to fire immediately by setting CC0 to 1µs.
+    // This makes the signal handler run promptly with SIGNAL_TIMER0,
+    // which (with batch_active=0) returns ACTION_END.
+    // Without this, the timeslot stays active for up to 99.5ms,
+    // blocking all subsequent mpsl_timeslot_request() with -35.
+    nrf_timer_cc_set(MPSL_TIMER0, NRF_TIMER_CC_CHANNEL0, 1);
+    nrf_timer_int_enable(MPSL_TIMER0, NRF_TIMER_INT_COMPARE0_MASK);
+
+    // Wait for MPSL to actually end the timeslot.
+    // The signal handler sets ts_started=0 when it returns ACTION_END.
+    // Timeout after 5ms as a safety net (TIMER0 should fire within ~1µs).
+    for (int i = 0; i < 500; i++) {
+        if (!atomic_get(&ts_started)) {
+            break;
+        }
+        k_busy_wait(10);
+    }
+
+    // Even if the wait timed out, clear ts_started so callers don't
+    // think a timeslot is still active.
     atomic_set(&ts_started, 0);
     LOG_INF("MPSL batch timeslot released");
 }
