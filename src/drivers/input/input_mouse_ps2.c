@@ -1708,8 +1708,23 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* Restart diversity receiver now that UARTE0 is active again. */
     ps2_uart_diversity_start_rx();
 
-    /* Release CLK — UART pins are stable, TP can transmit again. */
-    ps2_uart_release_bus(config->ps2_device);
+    /* DO NOT release CLK yet.  Both UARTEs are now listening
+     * (PM resume issued STARTRX, diversity_start_rx armed UARTE1).
+     * If we release CLK here, the TP — which was never sent F5 and
+     * still has reporting enabled — will immediately start clocking
+     * movement data.  Those bytes arrive with callback_enabled=false
+     * and go into the data queue, where they would be consumed as
+     * "responses" to the verify register reads below.
+     *
+     * By keeping CLK inhibited (GPIO_OUTPUT_LOW), the TP cannot
+     * transmit.  The first ps2_write() inside the verify reads calls
+     * set_mode_write() which also sets CLK to GPIO_OUTPUT_LOW
+     * (idempotent), then set_mode_read() releases CLK only when
+     * the TP needs to send the ACK/response — at which point
+     * write_awaits_resp is armed and the byte is routed correctly.
+     *
+     * CLK is released explicitly after the verify reads, or by the
+     * recovery path if the slow path is taken. */
 
     /* 4. Clear stale self-reset flag to avoid misalignment.  If the TP
      *    sent 0xAA just before suspend and we never received the 0x00,
@@ -1724,11 +1739,8 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
     /* Purge stale bytes from the PS/2 data queue.  During the 5ms
      * drain window (phase 1 → phase 2), the UART was still running
      * but the callback was disabled — any movement bytes the TP sent
-     * went into the data queue.  After bus release above, the TP may
-     * also have started transmitting immediately.  If these stale
-     * bytes are not purged, the verify reads below will consume them
-     * as "responses" to register read commands, causing the config
-     * byte to appear corrupted on every wake cycle. */
+     * went into the data queue.  CLK is still inhibited here so no
+     * new bytes can arrive during the purge. */
     ps2_uart_data_queue_empty(config->ps2_device);
 
     /* 5. Fast-path wake: verify config byte, skip full recovery if OK.
@@ -1810,6 +1822,13 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
         }
 
         ps2_uart_timeslot_batch_end();
+
+        /* Release CLK now that both verify reads are done.
+         * CLK was held inhibited since UART resume to prevent
+         * stale movement bytes from contaminating the data queue.
+         * Both the fast path (TP starts reporting normally) and
+         * slow path (recovery sends commands) need CLK released. */
+        ps2_uart_release_bus(config->ps2_device);
 
         if (fast_ok) {
             /* Fast path: TP is intact.  Re-enable the callback
