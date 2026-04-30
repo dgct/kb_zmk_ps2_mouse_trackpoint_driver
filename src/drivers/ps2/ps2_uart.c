@@ -78,9 +78,12 @@ static uint32_t uarte0_rxd_maxcnt;
 
 /* Deferred CLK calibration */
 static const struct device *cal_dev;   /* set once during init */
+static int deferred_cal_retries;       /* retries remaining */
 static void ps2_uart_deferred_cal_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(deferred_cal_work, ps2_uart_deferred_cal_handler);
-#define PS2_UART_DEFERRED_CAL_DELAY_MS 2000
+#define PS2_UART_DEFERRED_CAL_DELAY_MS 5000
+#define PS2_UART_DEFERRED_CAL_RETRY_MS 3000
+#define PS2_UART_DEFERRED_CAL_MAX_RETRIES 3
 
 /* Periodic stats logging */
 static void diversity_stats_work_handler(struct k_work *work);
@@ -1028,26 +1031,35 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
     // Consume UARTE1's byte even on success (stay in sync)
     uarte1_byte_ready = false;
 
-    // If write_byte_await_response() is waiting, we notify
-    // the blocked write process of whether it was a success or not.
+    // If write_byte_await_response() is waiting, check whether this
+    // byte is a PS/2 protocol response (ACK/NAK/ERR).  Only those
+    // values wake the blocked writer.  Any other byte (e.g. movement
+    // data from the TP's stream-mode buffer) is routed to the normal
+    // callback / data_queue path and the writer keeps waiting for the
+    // real ACK.  This matches Linux libps2's ps2_handle_ack() which
+    // silently drains non-ACK bytes during command exchanges.
+    //
+    // Why this is correct:
+    //  - PS/2 spec says the device ACKs (0xFA) each host byte before
+    //    sending any data.  So 0xFA IS the ACK, never movement data.
+    //  - When the host inhibits CLK for a write, the TP buffers at
+    //    most one movement packet.  That packet transmits after CLK
+    //    is released, BEFORE the ACK.  Without draining, the first
+    //    movement byte was mistaken for the ACK and the real ACK
+    //    leaked into the callback queue, corrupting packet alignment.
+    //  - The 50ms timeout handles the case where the ACK never comes.
     if (data->write_awaits_resp) {
-        data->write_awaits_resp_byte = byte;
-        data->write_awaits_resp = false;
-        k_sem_give(&data->write_awaits_resp_sem);
-
-        // Don't send ack and err responses to the callback and read
-        // data queue.
-        // If it's an ack, the write process will return success.
-        // If it's an error, the write process will return failure.
         if (byte == PS2_UART_RESP_ACK || byte == PS2_UART_RESP_RESEND ||
             byte == PS2_UART_RESP_FAILURE) {
-
+            data->write_awaits_resp_byte = byte;
+            data->write_awaits_resp = false;
+            k_sem_give(&data->write_awaits_resp_sem);
             return;
         }
 
-        // Non-ACK byte consumed as write response AND falls through
-        // to data_queue — log this rare but important case.
-        LOG_WRN("write_awaits_resp got non-ACK 0x%02x — falls through", byte);
+        // Non-protocol byte while awaiting ACK — drain it to the
+        // normal receive path.  The writer stays blocked.
+        LOG_DBG("write_awaits_resp: draining non-ACK 0x%02x", byte);
     }
 
     // If no callback is set, we add the data to a fifo queue
@@ -1552,12 +1564,11 @@ int ps2_uart_write_byte(const struct device *dev, uint8_t byte) {
     return err;
 }
 
-// Writes the byte and blocks execution until we read the
-// response byte.
-// Returns failure if the write fails or the response is 0xfe/0xfc (error)
-// Returns success if the response is 0xfa (ack) or any value except of
-// 0xfe.
-// 0xfe, 0xfc and 0xfa are not passed on to the read data queue or callback.
+// Writes the byte and blocks execution until we read a PS/2 protocol
+// response byte (0xFA ACK, 0xFE resend, or 0xFC failure).
+// Non-protocol bytes (e.g. buffered movement data) are drained by
+// the ISR handler and do NOT wake this function.
+// Returns 0 on ACK, error code on NAK/failure/timeout.
 int ps2_uart_write_byte_await_response(const struct device *dev, uint8_t byte) {
     struct ps2_uart_data *data = dev->data;
     int err;
@@ -1606,9 +1617,8 @@ int ps2_uart_write_byte_await_response(const struct device *dev, uint8_t byte) {
         return PS2_UART_E_WRITE_FAILURE;
     }
 
-    // Most of the time when a write was successful the device
-    // responds with an 0xfa (ack), but for some commands it doesn't.
-    // So we consider all non-0xfe and 0xfc responses as successful.
+    // ACK (0xFA) — the only expected success response.
+    // (Non-protocol bytes are drained by the ISR and never reach here.)
     return 0;
 }
 
@@ -2212,6 +2222,7 @@ ISR_DIRECT_DECLARE(uarte1_diversity_isr) {
  */
 static int ps2_uart_diversity_init(const struct device *dev) {
     cal_dev = dev;
+    deferred_cal_retries = PS2_UART_DEFERRED_CAL_MAX_RETRIES;
     LOG_INF("Diversity: using hardcoded baud, deferred calibration in %d ms",
             PS2_UART_DEFERRED_CAL_DELAY_MS);
     k_work_schedule(&deferred_cal_work, K_MSEC(PS2_UART_DEFERRED_CAL_DELAY_MS));
@@ -2322,8 +2333,17 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
 
     uint32_t clk_ticks = ps2_uart_calibrate_clk_period(cal_dev);
     if (clk_ticks == 0) {
-        LOG_WRN("Deferred calibration: no CLK edges, keeping baud 0x%08x",
-                old_baud);
+        if (deferred_cal_retries > 0) {
+            deferred_cal_retries--;
+            LOG_WRN("Deferred calibration: no CLK edges, retrying in %d ms "
+                    "(%d retries left)",
+                    PS2_UART_DEFERRED_CAL_RETRY_MS, deferred_cal_retries);
+            k_work_schedule(&deferred_cal_work,
+                           K_MSEC(PS2_UART_DEFERRED_CAL_RETRY_MS));
+        } else {
+            LOG_WRN("Deferred calibration: no CLK edges after all retries, "
+                    "keeping baud 0x%08x", old_baud);
+        }
         return;
     }
 
