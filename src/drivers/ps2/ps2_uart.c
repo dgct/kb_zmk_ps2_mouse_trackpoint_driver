@@ -1292,6 +1292,30 @@ static int ps2_uart_timeslot_acquire(void)
 // Mark that we're done with the timeslot. TIMER0 will end it naturally.
 static void ps2_uart_timeslot_end_and_wait(void)
 {
+    // If the timeslot already ended (EXTEND_FAILED → ACTION_END set
+    // ts_started=0, and SESSION_IDLE set ts_session_idle=1), skip the
+    // TIMER0 manipulation — the peripheral is no longer ours.
+    if (atomic_get(&ts_session_idle)) {
+        atomic_set(&ts_started, 0);
+        atomic_set(&ts_force_end, 0);
+        return;
+    }
+
+    if (!atomic_get(&ts_started)) {
+        // Timeslot ended but SESSION_IDLE hasn't arrived yet.
+        // Just wait for it — don't touch TIMER0.
+        for (int i = 0; i < 1000; i++) {
+            if (atomic_get(&ts_session_idle)) {
+                break;
+            }
+            k_busy_wait(10);
+        }
+        atomic_set(&ts_started, 0);
+        atomic_set(&ts_force_end, 0);
+        return;
+    }
+
+    // Timeslot is still active — trigger TIMER0 to end it.
     // Capture current TIMER0 counter and set CC0 just ahead of it.
     // Setting CC0=1 doesn't work because the counter has already
     // passed 1 (it's at ~37000µs for a batch).  COMPARE0 only fires
