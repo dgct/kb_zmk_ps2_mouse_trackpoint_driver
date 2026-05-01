@@ -589,6 +589,14 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
 
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
+    /* Reset idle timer on ANY received byte, not just valid packets.
+     * The TP is clearly alive if it's clocking data — prevent dormant
+     * entry during transient alignment errors or error-recovery bursts
+     * where valid-packet processing is temporarily failing. */
+    tp_idle_pm_notify_activity(data);
+#endif
+
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
 
     if (data->packet_idx >= sizeof(data->packet_buffer)) {
@@ -1010,10 +1018,6 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
     zmk_mouse_ps2_activity_click_buttons(data->dev, packet.button_l, packet.button_m, packet.button_r);
 
     data->prev_packet = packet;
-
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
-    tp_idle_pm_notify_activity(data);
-#endif
 }
 
 struct zmk_mouse_ps2_packet
