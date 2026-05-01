@@ -58,14 +58,4 @@ config ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS
       How long the trackpoint must be idle (no packets) before the driver
       enters dormant state. Default 30 seconds.
 
-config ZMK_INPUT_MOUSE_PS2_IDLE_PM_DORMANT_WATCHDOG_MS
-    int "Milliseconds in dormant before forced wake"
-    depends on ZMK_INPUT_MOUSE_PS2_IDLE_PM
-    default 5000
-    help
-      Safety watchdog for dormant state.  If the trackpoint has been
-      dormant for this long without a GPIO wake event, force a wake
-      cycle (F5+F4) to break a potential deadlock where the TP's
-      reporting was silently disabled.  Default 5 seconds.
-
 endif # ZMK_INPUT_MOUSE_PS2
