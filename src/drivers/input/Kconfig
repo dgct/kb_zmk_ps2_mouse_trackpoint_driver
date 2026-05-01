@@ -58,4 +58,8 @@ config ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS
       How long the trackpoint must be idle (no packets) before the driver
       enters dormant state. Default 30 seconds.
 
+module = INPUT_MOUSE_PS2
+module-str = input_mouse_ps2
+source "subsys/logging/Kconfig.template.log_config"
+
 endif # ZMK_INPUT_MOUSE_PS2
