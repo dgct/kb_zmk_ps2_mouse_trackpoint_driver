@@ -2237,7 +2237,7 @@ static uint32_t ps2_uart_ticks_to_baud_reg(uint32_t ticks) {
 /**
  * UARTE1 ISR — bare-metal interrupt handler for the diversity receiver.
  *
- * Fires ~30 µs after UARTE0's ISR due to the slower baud rate. Captures
+ * Fires ~30 µs BEFORE UARTE0's ISR due to the faster baud rate. Captures
  * the received byte and error state for the decision logic in
  * ps2_uart_read_process_received_byte().
  */
@@ -2430,12 +2430,17 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
             diversity_baud_center, diversity_baud_fast,
             diversity_baud_slow, old_baud);
 
-    /* Apply calibrated fast baud to UARTE0 */
-    NRF_UARTE0->BAUDRATE = diversity_baud_fast;
+    /* Apply calibrated slow baud to UARTE0 (primary, Zephyr-managed).
+     * UARTE0 fires ENDRX ~30µs AFTER UARTE1, so by the time the
+     * decision logic runs in UARTE0's ISR, uarte1_byte_ready is
+     * already set — enabling correct cross-validation. */
+    NRF_UARTE0->BAUDRATE = diversity_baud_slow;
     LOG_INF("Deferred cal: UARTE0 BAUDRATE 0x%08x → 0x%08x",
-            old_baud, diversity_baud_fast);
+            old_baud, diversity_baud_slow);
 
-    /* Bring up UARTE1 diversity receiver with the slow baud */
+    /* Bring up UARTE1 diversity receiver with the fast baud.
+     * UARTE1 fires ENDRX first, storing its byte before UARTE0's
+     * callback runs. */
     nrf_uarte_enable(NRF_UARTE1);
     nrf_uarte_disable(NRF_UARTE1);
 
@@ -2444,7 +2449,7 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     NRF_UARTE1->PSEL.CTS = NRF_UARTE_PSEL_DISCONNECTED;
     NRF_UARTE1->PSEL.RTS = NRF_UARTE_PSEL_DISCONNECTED;
     NRF_UARTE1->CONFIG = 0x0E;
-    NRF_UARTE1->BAUDRATE = diversity_baud_slow;
+    NRF_UARTE1->BAUDRATE = diversity_baud_fast;
     NRF_UARTE1->RXD.PTR = (uint32_t)&uarte1_dma_buf;
     NRF_UARTE1->RXD.MAXCNT = 1;
 
@@ -2466,7 +2471,7 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     uarte1_initialized = true;
 
     LOG_INF("Deferred cal: UARTE1 diversity receiver up at 0x%08x",
-            diversity_baud_slow);
+            diversity_baud_fast);
 
     k_work_schedule(&diversity_stats_work,
                     K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
