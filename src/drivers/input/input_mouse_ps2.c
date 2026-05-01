@@ -46,6 +46,10 @@ LOG_MODULE_REGISTER(input_mouse_ps2, CONFIG_INPUT_MOUSE_PS2_LOG_LEVEL);
 // How often the driver try to initialize a mouse before we give up.
 #define MOUSE_PS2_INIT_ATTEMPTS 25
 
+// Deferred TP settings retry (mimics deferred CLK calibration in ps2_uart.c)
+#define TP_DEFERRED_SETTINGS_DELAY_MS 3000
+#define TP_DEFERRED_SETTINGS_MAX_RETRIES 3
+
 // Mouse activity packets are at least three bytes.
 // This defines how much time between bytes can pass before
 // we give up on the packet and start fresh.
@@ -344,6 +348,10 @@ struct zmk_mouse_ps2_data {
                                    * reports the offset as a large movement (teleportation).
                                    * 3 packets ≈ 15ms at 200Hz — enough for TARE to settle. */
 
+    /* Deferred TP settings: retry apply_all_settings when timeslot unavailable at boot */
+    struct k_work_delayable deferred_settings_work;
+    int deferred_settings_retries;
+
     void *activity_callback;
     void *activity_resend_callback;
 
@@ -572,6 +580,38 @@ static int zmk_mouse_ps2_tp_apply_all_settings(const struct device *dev) {
     ps2_uart_timeslot_batch_end();
 
     return failures;
+}
+
+/*
+ * Deferred TP settings retry handler.
+ *
+ * If apply_all_settings failed at boot (timeslot unavailable), this work
+ * fires after a delay and retries.  Mimics the deferred CLK calibration
+ * pattern in ps2_uart.c.
+ */
+static void zmk_mouse_ps2_deferred_settings_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct zmk_mouse_ps2_data *data =
+        CONTAINER_OF(dwork, struct zmk_mouse_ps2_data, deferred_settings_work);
+    const struct device *dev = data->dev;
+
+    LOG_INF("Deferred TP settings: attempting apply (%d retries left)",
+            data->deferred_settings_retries);
+
+    int failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
+    if (failures > 0) {
+        if (data->deferred_settings_retries > 0) {
+            data->deferred_settings_retries--;
+            LOG_WRN("Deferred TP settings: %d failed, retrying in %d ms",
+                    failures, TP_DEFERRED_SETTINGS_DELAY_MS);
+            k_work_schedule(&data->deferred_settings_work,
+                           K_MSEC(TP_DEFERRED_SETTINGS_DELAY_MS));
+        } else {
+            LOG_ERR("Deferred TP settings: %d failed after all retries", failures);
+        }
+    } else {
+        LOG_INF("Deferred TP settings: all applied successfully");
+    }
 }
 
 static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work);
@@ -3301,7 +3341,14 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
 
         int tp_failures = zmk_mouse_ps2_tp_apply_all_settings(dev);
         if (tp_failures > 0) {
-            LOG_WRN("Init: %d TP setting(s) failed to apply", tp_failures);
+            LOG_WRN("Init: %d TP setting(s) failed to apply, "
+                    "scheduling deferred retry in %d ms",
+                    tp_failures, TP_DEFERRED_SETTINGS_DELAY_MS);
+            data->deferred_settings_retries = TP_DEFERRED_SETTINGS_MAX_RETRIES;
+            k_work_init_delayable(&data->deferred_settings_work,
+                                  zmk_mouse_ps2_deferred_settings_handler);
+            k_work_schedule(&data->deferred_settings_work,
+                           K_MSEC(TP_DEFERRED_SETTINGS_DELAY_MS));
         }
 
         if (config->scroll_mode) {
