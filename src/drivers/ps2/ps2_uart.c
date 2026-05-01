@@ -151,7 +151,7 @@ LOG_MODULE_REGISTER(ps2_uart);
 // split peripherals that multiplex TP + keys over the same BLE link.
 // Priority 9 sits just below BT_RX and just above the write queue (10).
 #define PS2_UART_WORK_QUEUE_CB_PRIORITY 9
-#define PS2_UART_WORK_QUEUE_CB_STACK_SIZE 1024
+#define PS2_UART_WORK_QUEUE_CB_STACK_SIZE 2048
 
 /*
  * PS/2 Defines
