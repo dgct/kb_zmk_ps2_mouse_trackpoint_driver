@@ -1575,9 +1575,6 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
         k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
         return;
     }
-    /* Drain any bytes triggered by F4's TARE recalibration */
-    k_msleep(1);
-    ps2_uart_data_queue_empty(config->ps2_device);
 
     /* Inhibit CLK before any pin transitions.  With CLK held LOW the
      * TP cannot clock data, so the UART pin disconnection during
