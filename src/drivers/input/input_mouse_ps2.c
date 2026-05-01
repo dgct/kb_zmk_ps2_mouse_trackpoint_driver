@@ -1550,7 +1550,8 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
 
     LOG_INF("TP idle PM: entering DORMANT (phase 2: suspend UART)");
 
-    /* Re-assert the reporting invariant before dormant entry.
+    /* Re-assert the reporting invariant before dormant entry — but
+     * ONLY if our cached state says reporting is off.
      *
      * The wake GPIO fires only when the TP transmits (DATA low = PS/2
      * start bit), which requires reporting-on.  If reporting was
@@ -1558,27 +1559,35 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
      * defaults, bus glitch interpreted as F5, etc.), the GPIO would
      * never fire — permanent deadlock.
      *
-     * F4 is idempotent when reporting is already on (ACK + small
-     * TARE).  When reporting was off, F4 re-enables it.  Either way,
-     * the invariant is restored before we suspend the UART.
+     * When activity_reporting_on is true (normal case), skip the F4.
+     * The TP has been streaming right up until the idle timeout fired,
+     * so reporting is demonstrably on.  Sending F4 in this state
+     * risks bus contention with the TP's last in-flight bytes (the
+     * 5ms drain only catches bytes already committed to the UART RX
+     * buffer — the TP may start a new frame concurrently with our
+     * write).  The collision can leave the TP in a state where it
+     * ACKs F4 but never actually resumes streaming.
      *
-     * Principle: never trust cached device state at a power boundary
-     * — always re-establish known-good state. */
-    err = ps2_write(config->ps2_device, MOUSE_PS2_CMD_ENABLE_REPORTING[0]);
-    if (err) {
-        LOG_WRN("TP idle PM: F4 pre-dormant attempt 1 failed (%d), "
-                "retrying", err);
-        k_msleep(5);
-        err = ps2_write(config->ps2_device,
-                        MOUSE_PS2_CMD_ENABLE_REPORTING[0]);
-    }
-    if (err) {
-        LOG_ERR("TP idle PM: F4 pre-dormant failed (%d), "
-                "aborting dormant — scheduling recovery", err);
-        ps2_enable_callback(config->ps2_device);
-        data->pm_state = TP_PM_ACTIVE;
-        k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
-        return;
+     * When activity_reporting_on is false (rare — only after a failed
+     * recovery or unexpected state), send F4 to re-establish the
+     * invariant before suspending. */
+    if (!data->activity_reporting_on) {
+        err = ps2_write(config->ps2_device, MOUSE_PS2_CMD_ENABLE_REPORTING[0]);
+        if (err) {
+            LOG_WRN("TP idle PM: F4 pre-dormant attempt 1 failed (%d), "
+                    "retrying", err);
+            k_msleep(5);
+            err = ps2_write(config->ps2_device,
+                            MOUSE_PS2_CMD_ENABLE_REPORTING[0]);
+        }
+        if (err) {
+            LOG_ERR("TP idle PM: F4 pre-dormant failed (%d), "
+                    "aborting dormant — scheduling recovery", err);
+            ps2_enable_callback(config->ps2_device);
+            data->pm_state = TP_PM_ACTIVE;
+            k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
+            return;
+        }
     }
 
     /* Inhibit CLK before any pin transitions.  With CLK held LOW the
