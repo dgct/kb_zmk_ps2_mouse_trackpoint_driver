@@ -1492,11 +1492,12 @@ static void tp_idle_pm_dormant_handler(struct k_work *work) {
         return;
     }
 
-    /* Guard: if reporting is off (F4 failed on last wake), entering
+    /* Guard: if reporting is off (e.g. self-reset reverted to factory
+     * defaults, or a bus glitch was interpreted as F5), entering
      * dormant would deadlock — the wake GPIO relies on the TP pulling
-     * DATA low, but after F5 (sent during wake) the TP won't transmit
-     * unless F4 re-enables reporting.  Instead of freezing, escalate
-     * to full recovery (F5 + re-apply all settings + F4). */
+     * DATA low, but with reporting disabled the TP won't transmit.
+     * Instead of freezing, escalate to full recovery (F5 + re-apply
+     * all settings + F4). */
     if (!data->activity_reporting_on) {
         if (data->recovery_fail_count >= 5) {
             LOG_ERR("TP idle PM: reporting off, recovery exhausted "
@@ -1693,9 +1694,9 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
 
     /* 2. Resume both UARTEs (UARTE0 via PM, then UARTE1 diversity).
      *    Also restores error interrupt and purges the data queue.
-     *    CLK stays inhibited on return — both UARTEs are armed but
-     *    the TP cannot transmit, preventing stale movement bytes
-     *    from contaminating the setting writes below.
+     *    CLK stays inhibited until step 4 — both UARTEs are armed
+     *    but the TP cannot transmit yet, preventing stale bytes
+     *    from arriving before the callback is enabled.
      *
      *    If resume fails after 3 retries, stay in DORMANT to avoid
      *    an unrecoverable broken-ACTIVE state. */
@@ -1724,85 +1725,46 @@ static void tp_idle_pm_wake_handler(struct k_work *work) {
 
     /* Enable the PS/2 callback before releasing CLK so the self-reset
      * detector (0xAA 0x00) is active the instant the TP starts
-     * transmitting.  Without this, a TP self-reset during the ~10ms
-     * wake window is silently eaten (bytes go to data_queue and get
-     * purged).  Idempotent with the later enable inside
-     * activity_reporting_enable(). */
+     * transmitting.  Without this, a TP self-reset during the wake
+     * window is silently eaten (bytes go to data_queue and get
+     * purged). */
     ps2_enable_callback(config->ps2_device);
 
-    /* Transition to ACTIVE before recovery so the activity callback
-     * sees the correct PM state. */
+    /* Transition to ACTIVE so the activity callback sees the correct
+     * PM state when the TP starts streaming. */
     data->pm_state = TP_PM_ACTIVE;
 
-    /* 4.5. Silence the TP before any register writes.
+    /* 4. Release CLK — the TP resumes streaming immediately.
      *
-     *    The TP was never sent F5 (disable) before dormant — it's
-     *    been accumulating movement data from noise/drift.  When CLK
-     *    goes HIGH, the TP immediately starts clocking out those
-     *    buffered bytes.
+     *    No F5/F4 on the wake hot path.  Reporting was left enabled
+     *    during dormant (that's what fires the wake GPIO), and TP
+     *    registers survive the power state — so the TP is already in
+     *    the correct configuration.  Any PS/2 write (F5 or F4) here
+     *    risks bus contention with the TP's buffered movement bytes,
+     *    which can leave the TP in an inconsistent state where it
+     *    ACKs F4 but never actually resumes streaming.
      *
-     *    Strategy: release CLK, immediately send F5 to silence the TP,
-     *    then do a short drain to catch any bytes that were in-flight
-     *    before F5 took effect.
+     *    The self-reset detector (0xAA 0x00) handles the rare case
+     *    where the TP silently reset during dormant and reverted to
+     *    factory defaults; it triggers a full recovery (with F5 +
+     *    register re-apply + F4) asynchronously.
      *
-     *    The F5 write itself inhibits CLK as part of PS/2 host-to-device
-     *    protocol, which aborts any in-progress device-to-host transfer.
-     *    After ACK, the TP stops streaming.  The bus is quiet for the
-     *    subsequent register writes. */
+     *    The pre-dormant F4 assertion in dormant_finish_handler
+     *    already guards against silent reporting-off (bus glitch
+     *    interpreted as F5).  That path is unchanged. */
     ps2_uart_release_bus(config->ps2_device);
 
-    int f5_err = ps2_write(config->ps2_device,
-                           MOUSE_PS2_CMD_DISABLE_REPORTING[0]);
-    if (f5_err) {
-        LOG_WRN("TP idle PM: F5 failed (%d), flushing 50ms instead", f5_err);
-        /* F5 failed — fall back to the old flush strategy. */
-        k_msleep(50);
-    } else {
-        /* F5 succeeded — short drain for any in-flight bytes.
-         * One PS/2 frame = 743µs at 14.8kHz; 1ms gives 35% margin. */
-        k_msleep(1);
-    }
-    ps2_uart_data_queue_empty(config->ps2_device);
+    data->recovery_fail_count = 0;
 
-    /* 5. Re-enable reporting (F4).
-     *
-     *    TP registers survive dormant — no need to re-apply settings.
-     *    The self-reset detector (0xAA 0x00) handles the rare case
-     *    where the TP silently resets and reverts to factory defaults;
-     *    it triggers a full recovery asynchronously.
-     *
-     *    This reduces the wake path from ~170ms of multi-byte 0xe2
-     *    extended writes (vulnerable to NACKs and SCL timeouts) to
-     *    two single-byte commands: F5 (already sent above) + F4. */
-    data->activity_reporting_on = false;
+    LOG_INF("TP idle PM: wake complete (no PS/2 writes)");
 
-    int err_f4 = -EAGAIN;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        err_f4 = zmk_mouse_ps2_activity_reporting_enable(dev);
-        if (err_f4 == 0) {
-            break;
-        }
-        LOG_WRN("TP idle PM: F4 re-enable attempt %d/3 failed (%d)",
-                attempt + 1, err_f4);
-        k_msleep(5 * (attempt + 1));
-    }
-    if (err_f4) {
-        LOG_ERR("TP idle PM: all F4 attempts failed (%d), "
-                "force-enabling callback", err_f4);
-        ps2_enable_callback(config->ps2_device);
-    } else {
-        data->recovery_fail_count = 0;
-        LOG_INF("TP idle PM: wake complete (F5+F4, no settings re-apply)");
-    }
-
-    /* Arm the post-TARE movement squelch.  F4 triggers a TARE
-     * recalibration — if the user's finger is on the stick (which
-     * it is, since that's what fired the wake GPIO), the old-to-new
-     * baseline delta gets reported as one large movement packet.
-     * Drop 3 packets (~15ms at 200Hz) for TARE to settle. */
+    /* Absorb any buffered drift bytes from the dormant period.
+     * Without F4 there's no TARE recalibration, but the TP may
+     * have accumulated a few LSBs of thermal drift.  Drop 3 packets
+     * (~15ms at 200Hz) so drift doesn't reach the cursor. */
     data->tare_squelch_packets = 3;
 
-    /* 6. Restart the idle timer. */
+    /* 5. Restart the idle timer. */
 
     k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
                                 K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
