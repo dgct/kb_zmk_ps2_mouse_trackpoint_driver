@@ -317,7 +317,7 @@ struct zmk_mouse_ps2_data {
     bool button_m_is_held;
     bool button_r_is_held;
 
-    bool activity_reporting_on;
+    volatile bool activity_reporting_on;
     bool is_trackpoint;
     uint8_t manufacturer_id;
     uint8_t secondary_id;
@@ -341,7 +341,7 @@ struct zmk_mouse_ps2_data {
     uint8_t recovery_fail_count; /* consecutive tp_recover_and_enable failures;
                                   * caps recovery livelock at 5 attempts */
 
-    int tare_squelch_packets;    /* Drop this many movement packets after F4.
+    volatile int tare_squelch_packets;    /* Drop this many movement packets after F4.
                                    * F4 triggers a TARE recalibration — if the user's finger
                                    * is on the stick (e.g. they moved it to wake), the TARE
                                    * sets the current pressure as zero.  On release the TP
@@ -363,7 +363,7 @@ struct zmk_mouse_ps2_data {
 #endif
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
-    enum {
+    volatile enum {
         TP_PM_UNINITIALIZED = 0, /* zero-init sentinel: listeners check != DORMANT, safe */
         TP_PM_ACTIVE,
         TP_PM_ENTERING_DORMANT, /* phase 1 done, draining; phase 2 pending */
@@ -977,8 +977,10 @@ static void zmk_mouse_ps2_tp_self_reset_work_handler(struct k_work *work) {
      * recovery.  Without this, a failed F4 on wake → recovery path
      * would never re-arm the idle timer, preventing future dormant
      * transitions (and their associated power savings). */
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)
     k_work_reschedule_for_queue(&tp_mgmt_wq, &data->idle_pm_dormant_work,
                                 K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM_TIMEOUT_MS));
+#endif
 }
 
 void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
@@ -1322,7 +1324,7 @@ struct zmk_mouse_ps2_send_cmd_resp zmk_mouse_ps2_send_cmd(const struct device *d
     if (resp_len > sizeof(resp.resp_buffer)) {
         resp.err = -11;
         snprintf(resp.err_msg, sizeof(resp.err_msg),
-                 "Response can't be longer than the resp_buffer (%d)", sizeof(resp.err_msg));
+                 "Response can't be longer than the resp_buffer (%d)", sizeof(resp.resp_buffer));
 
         return resp;
     }
@@ -1628,6 +1630,7 @@ static void tp_idle_pm_dormant_finish_handler(struct k_work *work) {
             k_work_submit_to_queue(&tp_mgmt_wq, &data->tp_self_reset_work);
             return;
         }
+        data->activity_reporting_on = true;
     }
 
     /* Inhibit CLK before any pin transitions.  With CLK held LOW the
@@ -2946,6 +2949,19 @@ int zmk_mouse_ps2_settings_reset_setting(char *setting_name) {
     return err;
 }
 
+/*
+ * Settings save work handler — runs on sysworkq.
+ *
+ * NOTE (S1): NVS flash writes via settings_save_one block the sysworkq
+ * for up to ~7.5ms per key (flash page erase + program).  With 10 keys
+ * this can hold sysworkq for ~75ms total.  This is a bounded latency
+ * hit that can delay other sysworkq-submitted work (e.g. BLE event
+ * processing) during the save window.  A dedicated settings work queue
+ * would fix this, but would require Zephyr settings thread-safety
+ * guarantees that are not currently provided.  Accepted as a known
+ * limitation since saves are infrequent (debounced, user-initiated
+ * sensitivity changes only).
+ */
 static void zmk_mouse_ps2_settings_save_work(struct k_work *work) {
 
     struct k_work_delayable *work_delayable = (struct k_work_delayable *)work;
@@ -3200,12 +3216,14 @@ static int zmk_mouse_ps2_settings_restore_dev(const struct device *dev,
 
 static int zmk_mouse_ps2_settings_restore(const char *name, size_t len, settings_read_cb read_cb,
                                           void *cb_arg) {
+    int rc = -EINVAL;
 
     #define ZMK_PS2_MOUSE_DEFINE_SETTINGS_RESTORE_DEV(n) \
-        zmk_mouse_ps2_settings_restore_dev(data##n.dev, name, len, read_cb, cb_arg);
+        { int _rc = zmk_mouse_ps2_settings_restore_dev(data##n.dev, name, len, read_cb, cb_arg); \
+          if (_rc == 0) { rc = 0; } }
     DT_INST_FOREACH_STATUS_OKAY(ZMK_PS2_MOUSE_DEFINE_SETTINGS_RESTORE_DEV)
 
-    return -EINVAL;
+    return rc;
 }
 
 struct settings_handler zmk_mouse_ps2_settings_conf = {
@@ -3332,6 +3350,11 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
             data->tp_reach = config->tp_reach;
         }
 
+        /* Load saved settings from flash BEFORE apply_all_settings.
+         * This ensures saved values override DT defaults and are sent
+         * to the TP in a single pass, avoiding double-writes. */
+        zmk_mouse_ps2_settings_init(dev);
+
         /* Acquire a batch timeslot covering apply_all + scroll mode. */
         int batch_err = ps2_uart_timeslot_batch_begin();
         if (batch_err) {
@@ -3362,7 +3385,9 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         zmk_mouse_ps2_set_packet_mode(dev, MOUSE_PS2_PACKET_MODE_SCROLL);
     }
 
-    zmk_mouse_ps2_settings_init(dev);
+    if (!data->is_trackpoint) {
+        zmk_mouse_ps2_settings_init(dev);
+    }
 
     // Configure read callback
     LOG_DBG("Configuring ps2 callback...");
@@ -3389,21 +3414,24 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     // work handler and faults.
     k_work_init_delayable(&data->packet_buffer_timeout, zmk_mouse_ps2_activity_packet_timout);
 
+    /* Start the management work queue before enabling reporting —
+     * if F4 fails, the self-reset recovery path needs to submit
+     * work to tp_mgmt_wq immediately. */
+    if (!tp_mgmt_wq_started) {
+        k_work_queue_init(&tp_mgmt_wq);
+        k_work_queue_start(&tp_mgmt_wq, tp_mgmt_wq_stack,
+                           K_THREAD_STACK_SIZEOF(tp_mgmt_wq_stack),
+                           TP_MGMT_WQ_PRIORITY, NULL);
+        k_thread_name_set(&tp_mgmt_wq.thread, "tp_mgmt");
+        tp_mgmt_wq_started = true;
+    }
+
     LOG_INF("Enabling data reporting and ps2 callback...");
     err = zmk_mouse_ps2_activity_reporting_enable(dev);
     if (err) {
         LOG_ERR("Could not activate ps2 callback: %d", err);
     } else {
         LOG_DBG("Successfully activated ps2 callback");
-        if (!tp_mgmt_wq_started) {
-            k_work_queue_init(&tp_mgmt_wq);
-            k_work_queue_start(&tp_mgmt_wq, tp_mgmt_wq_stack,
-                               K_THREAD_STACK_SIZEOF(tp_mgmt_wq_stack),
-                               TP_MGMT_WQ_PRIORITY, NULL);
-            k_thread_name_set(&tp_mgmt_wq.thread, "tp_mgmt");
-            tp_mgmt_wq_started = true;
-        }
-
     }
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_PM)

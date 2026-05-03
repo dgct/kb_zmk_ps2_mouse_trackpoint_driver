@@ -21,6 +21,8 @@
 #include <hal/nrf_ppi.h>
 #include <hal/nrf_timer.h>
 #include <nrfx.h>
+#include <nrfx_ppi.h>
+#include <nrfx_gpiote.h>
 
 /*
  * Dual-UARTE Diversity Receiver with erasure-code repair
@@ -57,25 +59,26 @@
 #define PS2_UART_CAL_TIMEOUT_US   50000   /* 50 ms max wait per edge */
 
 /* GPIOTE channel and PPI channel for calibration (lowest = safest) */
-#define PS2_UART_CAL_GPIOTE_CH       0
-#define PS2_UART_CAL_PPI_CH          0
+/* PPI and GPIOTE channels are allocated at runtime via nrfx to
+ * avoid conflicts with MPSL, SoftDevice Controller, and other
+ * nrfx drivers that share these fixed-count hardware resources. */
 
 /* Diversity receiver state */
 static volatile uint8_t  uarte1_dma_buf;
 static volatile uint8_t  uarte1_last_byte;
 static volatile uint32_t uarte1_last_err;
 static volatile bool     uarte1_byte_ready;
-static bool              uarte1_initialized;
-static bool              uart_suspended;
+static volatile bool     uarte1_initialized;
+static volatile bool     uart_suspended;
 
 /* Error counters */
-static uint32_t diversity_err_uarte0_framing;
-static uint32_t diversity_err_uarte0_other;
-static uint32_t diversity_err_uarte1_recovered;
-static uint32_t diversity_err_both_failed;
-static uint32_t diversity_err_cross_validated;  /* both clean & agree */
-static uint32_t diversity_err_cross_mismatch;   /* both clean but disagree */
-static uint32_t diversity_byte_count;
+static atomic_t diversity_err_uarte0_framing;
+static atomic_t diversity_err_uarte0_other;
+static atomic_t diversity_err_uarte1_recovered;
+static atomic_t diversity_err_both_failed;
+static atomic_t diversity_err_cross_validated;  /* both clean & agree */
+static atomic_t diversity_err_cross_mismatch;   /* both clean but disagree */
+static atomic_t diversity_byte_count;
 
 /* Calibrated baud registers */
 static uint32_t diversity_baud_center;
@@ -94,6 +97,12 @@ K_WORK_DELAYABLE_DEFINE(deferred_cal_work, ps2_uart_deferred_cal_handler);
 #define PS2_UART_DEFERRED_CAL_DELAY_MS 5000
 #define PS2_UART_DEFERRED_CAL_RETRY_MS 3000
 #define PS2_UART_DEFERRED_CAL_MAX_RETRIES 3
+
+/* Dedicated work queue for calibration — avoids blocking sysworkq
+ * during the ~800ms busy-wait measurement loop. */
+static K_THREAD_STACK_DEFINE(cal_wq_stack, 1024);
+static struct k_work_q cal_wq;
+static bool cal_wq_started;
 
 /* Periodic stats logging */
 static void diversity_stats_work_handler(struct k_work *work);
@@ -284,7 +293,7 @@ struct ps2_uart_data {
     ps2_uart_write_status cur_write_status;
     uint8_t cur_write_byte;
     int cur_write_pos;
-    bool write_awaits_resp;
+    volatile bool write_awaits_resp;
     uint8_t write_awaits_resp_byte;
     struct k_sem write_awaits_resp_sem;
     struct k_sem write_lock;
@@ -426,7 +435,7 @@ void ps2_uart_set_sda(const struct device *dev, int state) {
     gpio_pin_set_dt(&config->sda_gpio, state);
 }
 
-int ps2_uart_configure_pin_scl(const struct device *dev, gpio_flags_t flags, char *descr) {
+int ps2_uart_configure_pin_scl(const struct device *dev, gpio_flags_t flags, const char *descr) {
     const struct ps2_uart_config *config = dev->config;
     int err;
 
@@ -535,6 +544,7 @@ void ps2_uart_release_bus(const struct device *dev) {
 int ps2_uart_pm_suspend(const struct device *dev, const struct device *uart_dev) {
     uart_suspended = true;
     ps2_uart_diversity_stop_rx();
+    k_work_cancel_delayable(&diversity_stats_work);
 
     int err = pm_device_action_run(uart_dev, PM_DEVICE_ACTION_SUSPEND);
     if (err && err != -EALREADY) {
@@ -591,6 +601,12 @@ int ps2_uart_pm_resume(const struct device *dev, const struct device *uart_dev) 
 
     /* Restart diversity receiver now that UARTE0 is active */
     ps2_uart_diversity_start_rx();
+
+    /* Restart periodic diversity stats logging if diversity is active */
+    if (uarte1_initialized) {
+        k_work_schedule(&diversity_stats_work,
+                        K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
+    }
 
     /* Purge stale bytes from the data queue.  During the 5ms drain
      * window (dormant phase 1 → phase 2), the UART was still running
@@ -758,7 +774,7 @@ bool ps2_uart_get_byte_parity(uint8_t byte) {
     return !byte_parity;
 }
 
-uint8_t ps2_uart_data_queue_get_next(const struct device *dev, uint8_t *dst_byte, k_timeout_t timeout) {
+int ps2_uart_data_queue_get_next(const struct device *dev, uint8_t *dst_byte, k_timeout_t timeout) {
     struct ps2_uart_data *data = dev->data;
     struct ps2_uart_data_queue_item queue_data;
     int ret;
@@ -835,17 +851,9 @@ void ps2_uart_send_cmd_resend_worker(struct k_work *item) {
 void ps2_uart_send_cmd_resend(const struct device *dev) {
     struct ps2_uart_data *data = dev->data;
 
-    if (k_is_in_isr()) {
-
-        // It's important to submit this on the cb queue and not on the
-        // same queue as the inhibition delay.
-        // Otherwise the queue will be blocked by the semaphore and the
-        // inhibition delay worker will never be called.
-        k_work_submit_to_queue(&ps2_uart_work_queue_cb, &data->resend_cmd_work);
-    } else {
-        // ps2_uart_send_cmd_resend_worker(NULL);
-        k_work_submit_to_queue(&ps2_uart_work_queue_cb, &data->resend_cmd_work);
-    }
+    /* Submit on the cb queue (not the inhibition-delay queue) to avoid
+     * blocking the semaphore.  Safe from both ISR and thread context. */
+    k_work_submit_to_queue(&ps2_uart_work_queue_cb, &data->resend_cmd_work);
 }
 
 // Extract port and pin from pinctrl to log it
@@ -929,28 +937,26 @@ void ps2_uart_read_interrupt_handler(const struct device *uart_dev, void *user_d
 }
 
 static int ps2_uart_read_err_check(const struct device *dev) {
-    // TOOD: Make this function only work if nrf52 is used
     int err = uart_err_check(dev);
 
-    // In the config we enabled even parity, because nrf52 does
-    // not support odd parity.
-    // But PS/2 uses odd parity. This should generate a parity error on
-    // every reception.
-    // If the parity error doesn't happen, it means the transfer had an
-    // actual even parity, which we consider an error.
-    if ((err & NRF_UARTE_ERROR_PARITY_MASK) == 0) {
-        err = UART_ERROR_PARITY;
-    } else if (err & NRF_UARTE_ERROR_OVERRUN_MASK) {
-        err = UART_ERROR_OVERRUN;
+    /* PS/2 uses odd parity; nRF52 only supports even.  A parity
+     * error from the UARTE means it expected even but got odd — which
+     * IS the correct PS/2 parity.  So PARITY bit SET = no error.
+     *
+     * Check order matters for compound errors:
+     *   OVERRUN first (always fatal — data lost in shift register),
+     *   then FRAMING (recoverable via diversity receiver),
+     *   then parity-absence (real PS/2 parity error).
+     */
+    if (err & NRF_UARTE_ERROR_OVERRUN_MASK) {
+        return UART_ERROR_OVERRUN;
     } else if (err & NRF_UARTE_ERROR_FRAMING_MASK) {
-        err = UART_ERROR_FRAMING;
-    } else if (err & NRF_UARTE_ERROR_BREAK_MASK) {
-        err = UART_BREAK;
-    } else { // No errors
-        err = 0;
+        return UART_ERROR_FRAMING;
+    } else if ((err & NRF_UARTE_ERROR_PARITY_MASK) == 0) {
+        return UART_ERROR_PARITY;
     }
 
-    return err;
+    return 0;
 }
 
 void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte) {
@@ -961,7 +967,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
 
     LOG_DBG("UART Received: 0x%x", byte);
 
-    diversity_byte_count++;
+    atomic_inc(&diversity_byte_count);
 
     err = ps2_uart_read_err_check(config->uart_dev);
     if (err != 0) {
@@ -978,7 +984,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
          * Non-framing error → real corruption, discard */
 
         if (err == UART_ERROR_FRAMING) {
-            diversity_err_uarte0_framing++;
+            atomic_inc(&diversity_err_uarte0_framing);
 
             if (uarte1_byte_ready) {
                 int u1_err = ps2_uart_diversity_check_err(uarte1_last_err);
@@ -987,7 +993,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
 
                 if (u1_err == 0) {
                     /* Normal fallback: UARTE1 decoded cleanly */
-                    diversity_err_uarte1_recovered++;
+                    atomic_inc(&diversity_err_uarte1_recovered);
                     LOG_DBG("Diversity: UARTE1 recovered byte 0x%02x "
                             "(UARTE0 had framing for 0x%02x)",
                             u1_byte, byte);
@@ -996,7 +1002,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                 } else if (u1_err == UART_ERROR_FRAMING) {
                     /* Both framing errors — TP clock outside the
                      * combined coverage band.  Discard. */
-                    diversity_err_both_failed++;
+                    atomic_inc(&diversity_err_both_failed);
                     LOG_WRN("Diversity: both framing "
                             "(u0=0x%02x, u1=0x%02x), discarding",
                             byte, u1_byte);
@@ -1004,7 +1010,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                 } else {
                     /* UARTE1 has a non-framing error (parity, overrun).
                      * Real corruption.  Discard. */
-                    diversity_err_both_failed++;
+                    atomic_inc(&diversity_err_both_failed);
                     LOG_WRN("Diversity: both failed "
                             "(u0=0x%02x framing, u1=0x%02x %s)",
                             byte, u1_byte,
@@ -1013,7 +1019,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                 }
             } else {
                 /* UARTE1 not ready — can't repair.  Discard. */
-                diversity_err_both_failed++;
+                atomic_inc(&diversity_err_both_failed);
                 LOG_DBG("Diversity: UARTE0 framing, UARTE1 not ready, "
                         "discarding 0x%02x", byte);
                 return;
@@ -1021,7 +1027,7 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
         } else {
             /* Non-framing error on UARTE0 (parity, overrun) — real
              * corruption, not baud mismatch.  Discard. */
-            diversity_err_uarte0_other++;
+            atomic_inc(&diversity_err_uarte0_other);
             LOG_WRN("UART RX error for byte 0x%x: %s (%d)",
                     byte, err_str, err);
             uarte1_byte_ready = false;
@@ -1036,13 +1042,13 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
 
         if (u1_err == 0) {
             if (u1_byte == byte) {
-                diversity_err_cross_validated++;
+                atomic_inc(&diversity_err_cross_validated);
             } else {
                 /* Both decoded cleanly but disagree — indicates
                  * non-framing corruption (bit flip, noise).
                  * Prefer UARTE0 (primary, Zephyr-managed) but
                  * log for telemetry. */
-                diversity_err_cross_mismatch++;
+                atomic_inc(&diversity_err_cross_mismatch);
                 LOG_WRN("Diversity: cross-validation mismatch "
                         "(u0=0x%02x, u1=0x%02x)", byte, u1_byte);
             }
@@ -1404,6 +1410,14 @@ int ps2_uart_timeslot_batch_begin(void)
     // Just bump the refcount so batch_end() knows not to release yet.
     // BUT: if ts_started is 0 the outer timeslot died (extension
     // failed).  Fall through to request a fresh one.
+    //
+    // NOTE (benign race): Between the two atomic_get() reads, TIMER0
+    // could fire and clear ts_started.  In that case we fall through
+    // and request a fresh timeslot, resetting ts_batch_active — the
+    // outer batch's refcount is lost, degrading to per-byte
+    // protection.  A spinlock would fix this but is incompatible
+    // with the MPSL signal handler context.  The worst-case effect
+    // is one redundant timeslot request per batch boundary.
     if (atomic_get(&ts_batch_active) > 0 && atomic_get(&ts_started)) {
         atomic_inc(&ts_batch_active);
         return 0;
@@ -1477,81 +1491,6 @@ void ps2_uart_timeslot_batch_end(void)
 #endif /* IS_ENABLED(CONFIG_PS2_UART_TIMESLOT_PROTECTION) */
 
 K_MUTEX_DEFINE(ps2_uart_write_mutex);
-
-int ps2_uart_write_byte_debug(const struct device *dev, uint8_t byte) {
-    int err;
-
-    LOG_WRN("DEBUG WRITE STARTED for byte 0x%x", byte);
-
-    LOG_WRN("Setting Write mode");
-    err = ps2_uart_set_mode_write(dev);
-    if (err != 0) {
-        LOG_ERR("Could not configure driver for write mode: %d", err);
-        return err;
-    }
-    // k_sleep(K_MSEC(1000));
-    // err = ps2_uart_set_mode_write(dev);
-    // if (err != 0) {
-    //  LOG_ERR("Could not configure driver for write mode: %d", err);
-    //  return err;
-    // }
-    LOG_WRN("Setting Write mode: Done");
-
-    // Inhibit the line by setting clock low and data high for 100us
-    LOG_INF("Setting low");
-    ps2_uart_set_scl(dev, 0);
-    ps2_uart_set_sda(dev, 0);
-    k_sleep(K_MSEC(100));
-
-    LOG_INF("Setting high");
-    ps2_uart_set_scl(dev, 1);
-    ps2_uart_set_sda(dev, 1);
-    k_sleep(K_MSEC(100));
-
-    LOG_INF("Setting low");
-    ps2_uart_set_scl(dev, 0);
-    ps2_uart_set_sda(dev, 0);
-    k_sleep(K_MSEC(100));
-
-    LOG_INF("Setting high");
-    ps2_uart_set_scl(dev, 1);
-    ps2_uart_set_sda(dev, 1);
-    k_sleep(K_MSEC(100));
-
-    LOG_INF("Setting low");
-    ps2_uart_set_scl(dev, 0);
-    ps2_uart_set_sda(dev, 0);
-    k_sleep(K_MSEC(100));
-
-    LOG_INF("Setting high");
-    ps2_uart_set_scl(dev, 1);
-    ps2_uart_set_sda(dev, 1);
-    k_sleep(K_MSEC(100));
-
-    LOG_INF("Setting low");
-    ps2_uart_set_scl(dev, 0);
-    ps2_uart_set_sda(dev, 0);
-    k_sleep(K_MSEC(100));
-
-    LOG_WRN("Enabling interrupt callback");
-    ps2_uart_set_scl_callback_enabled(dev, true);
-
-    LOG_WRN("Setting SCL input");
-    ps2_uart_configure_pin_scl_input(dev);
-
-    k_sleep(K_MSEC(300));
-
-    LOG_WRN("Switching back to mode read");
-    err = ps2_uart_set_mode_read(dev);
-    if (err != 0) {
-        LOG_ERR("Could not configure driver for write mode: %d", err);
-        return err;
-    }
-
-    LOG_WRN("Finished Debug write");
-
-    return -1;
-}
 
 int ps2_uart_write_byte(const struct device *dev, uint8_t byte) {
     int err;
@@ -2149,6 +2088,27 @@ static uint32_t ps2_uart_calibrate_clk_period(const struct device *dev) {
     uint32_t deltas[PS2_UART_CAL_EDGES];
     uint32_t prev_ts = 0;
     int count = 0;
+    nrfx_err_t nerr;
+    nrf_ppi_channel_t cal_ppi_ch;
+    uint8_t cal_gpiote_ch;
+
+    /* Allocate PPI channel (respects MPSL/SDC reservations) */
+    nerr = nrfx_ppi_channel_alloc(&cal_ppi_ch);
+    if (nerr != NRFX_SUCCESS) {
+        LOG_WRN("CLK calibration: PPI channel alloc failed (0x%x)", nerr);
+        return 0;
+    }
+
+    /* Allocate GPIOTE channel */
+    nerr = nrfx_gpiote_channel_alloc(&nrfx_gpiote, &cal_gpiote_ch);
+    if (nerr != NRFX_SUCCESS) {
+        LOG_WRN("CLK calibration: GPIOTE channel alloc failed (0x%x)", nerr);
+        nrfx_ppi_channel_free(cal_ppi_ch);
+        return 0;
+    }
+
+    LOG_DBG("CLK calibration: allocated PPI CH%u, GPIOTE CH%u",
+            (unsigned)cal_ppi_ch, cal_gpiote_ch);
 
     /* --- Configure TIMER3: 16 MHz, 32-bit, timer mode --- */
     nrf_timer_mode_set(NRF_TIMER3, NRF_TIMER_MODE_TIMER);
@@ -2158,27 +2118,27 @@ static uint32_t ps2_uart_calibrate_clk_period(const struct device *dev) {
     nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_START);
 
     /* --- Configure GPIOTE CH[n]: Event mode, falling edge on CLK pin --- */
-    nrf_gpiote_event_configure(NRF_GPIOTE, PS2_UART_CAL_GPIOTE_CH,
+    nrf_gpiote_event_configure(NRF_GPIOTE, cal_gpiote_ch,
                                config->scl_gpio.pin,
                                NRF_GPIOTE_POLARITY_HITOLO);
-    nrf_gpiote_event_enable(NRF_GPIOTE, PS2_UART_CAL_GPIOTE_CH);
+    nrf_gpiote_event_enable(NRF_GPIOTE, cal_gpiote_ch);
 
     /* --- Configure PPI: GPIOTE IN[n] → TIMER3 CAPTURE[0] --- */
     nrf_ppi_channel_endpoint_setup(
-        NRF_PPI, (nrf_ppi_channel_t)PS2_UART_CAL_PPI_CH,
+        NRF_PPI, cal_ppi_ch,
         nrf_gpiote_event_address_get(NRF_GPIOTE,
-                                     nrf_gpiote_in_event_get(PS2_UART_CAL_GPIOTE_CH)),
+                                     nrf_gpiote_in_event_get(cal_gpiote_ch)),
         nrf_timer_task_address_get(NRF_TIMER3, NRF_TIMER_TASK_CAPTURE0));
-    nrf_ppi_channel_enable(NRF_PPI, (nrf_ppi_channel_t)PS2_UART_CAL_PPI_CH);
+    nrf_ppi_channel_enable(NRF_PPI, cal_ppi_ch);
 
     /* --- Sample CLK edges --- */
     for (int i = 0; i < PS2_UART_CAL_EDGES; i++) {
         nrf_gpiote_event_clear(NRF_GPIOTE,
-                               nrf_gpiote_in_event_get(PS2_UART_CAL_GPIOTE_CH));
+                               nrf_gpiote_in_event_get(cal_gpiote_ch));
 
         int timeout_us = PS2_UART_CAL_TIMEOUT_US;
         while (!nrf_gpiote_event_check(NRF_GPIOTE,
-                                       nrf_gpiote_in_event_get(PS2_UART_CAL_GPIOTE_CH))) {
+                                       nrf_gpiote_in_event_get(cal_gpiote_ch))) {
             k_busy_wait(1);
             if (--timeout_us <= 0) {
                 LOG_WRN("CLK calibration: timeout waiting for edge %d", i);
@@ -2201,11 +2161,13 @@ static uint32_t ps2_uart_calibrate_clk_period(const struct device *dev) {
 
 teardown:
     /* --- Release all resources --- */
-    nrf_ppi_channel_disable(NRF_PPI, (nrf_ppi_channel_t)PS2_UART_CAL_PPI_CH);
-    nrf_gpiote_event_disable(NRF_GPIOTE, PS2_UART_CAL_GPIOTE_CH);
-    nrf_gpiote_te_default(NRF_GPIOTE, PS2_UART_CAL_GPIOTE_CH);
+    nrf_ppi_channel_disable(NRF_PPI, cal_ppi_ch);
+    nrf_gpiote_event_disable(NRF_GPIOTE, cal_gpiote_ch);
+    nrf_gpiote_te_default(NRF_GPIOTE, cal_gpiote_ch);
     nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_STOP);
     nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_CLEAR);
+    nrfx_ppi_channel_free(cal_ppi_ch);
+    nrfx_gpiote_channel_free(&nrfx_gpiote, cal_gpiote_ch);
 
     if (count < 4) {
         LOG_WRN("CLK calibration: only %d valid samples, need >= 4", count);
@@ -2279,9 +2241,20 @@ ISR_DIRECT_DECLARE(uarte1_diversity_isr) {
 static int ps2_uart_diversity_init(const struct device *dev) {
     cal_dev = dev;
     deferred_cal_retries = PS2_UART_DEFERRED_CAL_MAX_RETRIES;
+
+    if (!cal_wq_started) {
+        k_work_queue_init(&cal_wq);
+        k_work_queue_start(&cal_wq, cal_wq_stack,
+                           K_THREAD_STACK_SIZEOF(cal_wq_stack),
+                           K_PRIO_PREEMPT(14), NULL);
+        k_thread_name_set(&cal_wq.thread, "ps2_cal");
+        cal_wq_started = true;
+    }
+
     LOG_INF("Diversity: using hardcoded baud, deferred calibration in %d ms",
             PS2_UART_DEFERRED_CAL_DELAY_MS);
-    k_work_schedule(&deferred_cal_work, K_MSEC(PS2_UART_DEFERRED_CAL_DELAY_MS));
+    k_work_schedule_for_queue(&cal_wq, &deferred_cal_work,
+                              K_MSEC(PS2_UART_DEFERRED_CAL_DELAY_MS));
     return 0;
 }
 
@@ -2392,8 +2365,8 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     if (uart_suspended) {
         LOG_INF("Deferred calibration: UART suspended, deferring %d ms",
                 PS2_UART_DEFERRED_CAL_RETRY_MS);
-        k_work_schedule(&deferred_cal_work,
-                       K_MSEC(PS2_UART_DEFERRED_CAL_RETRY_MS));
+        k_work_schedule_for_queue(&cal_wq, &deferred_cal_work,
+                                  K_MSEC(PS2_UART_DEFERRED_CAL_RETRY_MS));
         return;
     }
 
@@ -2406,8 +2379,8 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
             LOG_WRN("Deferred calibration: no CLK edges, retrying in %d ms "
                     "(%d retries left)",
                     PS2_UART_DEFERRED_CAL_RETRY_MS, deferred_cal_retries);
-            k_work_schedule(&deferred_cal_work,
-                           K_MSEC(PS2_UART_DEFERRED_CAL_RETRY_MS));
+            k_work_schedule_for_queue(&cal_wq, &deferred_cal_work,
+                                      K_MSEC(PS2_UART_DEFERRED_CAL_RETRY_MS));
         } else {
             LOG_WRN("Deferred calibration: no CLK edges after all retries, "
                     "keeping baud 0x%08x", old_baud);
@@ -2433,8 +2406,13 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     /* Apply calibrated slow baud to UARTE0 (primary, Zephyr-managed).
      * UARTE0 fires ENDRX ~30µs AFTER UARTE1, so by the time the
      * decision logic runs in UARTE0's ISR, uarte1_byte_ready is
-     * already set — enabling correct cross-validation. */
+     * already set — enabling correct cross-validation.
+     *
+     * Inhibit CLK while changing BAUDRATE to prevent corruption of
+     * any in-flight byte. */
+    ps2_uart_inhibit_bus(cal_dev);
     NRF_UARTE0->BAUDRATE = diversity_baud_slow;
+    ps2_uart_release_bus(cal_dev);
     LOG_INF("Deferred cal: UARTE0 BAUDRATE 0x%08x → 0x%08x",
             old_baud, diversity_baud_slow);
 
@@ -2448,7 +2426,11 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     NRF_UARTE1->PSEL.TXD = NRF_UARTE_PSEL_DISCONNECTED;
     NRF_UARTE1->PSEL.CTS = NRF_UARTE_PSEL_DISCONNECTED;
     NRF_UARTE1->PSEL.RTS = NRF_UARTE_PSEL_DISCONNECTED;
-    NRF_UARTE1->CONFIG = 0x0E;
+    /* CONFIG: HWFC=disabled, PARITY=included (bits 1-3 = 0x7),
+     * matching UARTE0's even-parity config for PS/2 odd-parity trick.
+     * STOP=one (bit 4=0). */
+    NRF_UARTE1->CONFIG =
+        (UARTE_CONFIG_PARITY_Included << UARTE_CONFIG_PARITY_Pos);
     NRF_UARTE1->BAUDRATE = diversity_baud_fast;
     NRF_UARTE1->RXD.PTR = (uint32_t)&uarte1_dma_buf;
     NRF_UARTE1->RXD.MAXCNT = 1;
@@ -2481,17 +2463,19 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
  * Periodic stats logging work handler.
  */
 static void diversity_stats_work_handler(struct k_work *work) {
-    if (diversity_byte_count > 0 || diversity_err_uarte1_recovered > 0) {
+    atomic_val_t total = atomic_get(&diversity_byte_count);
+    atomic_val_t recovered = atomic_get(&diversity_err_uarte1_recovered);
+    if (total > 0 || recovered > 0) {
         LOG_INF("Diversity stats: total=%u, u0_framing=%u, u0_other=%u, "
                 "u1_recovered=%u, both_failed=%u, "
                 "xval_ok=%u, xval_mismatch=%u",
-                diversity_byte_count,
-                diversity_err_uarte0_framing,
-                diversity_err_uarte0_other,
-                diversity_err_uarte1_recovered,
-                diversity_err_both_failed,
-                diversity_err_cross_validated,
-                diversity_err_cross_mismatch);
+                (uint32_t)total,
+                (uint32_t)atomic_get(&diversity_err_uarte0_framing),
+                (uint32_t)atomic_get(&diversity_err_uarte0_other),
+                (uint32_t)recovered,
+                (uint32_t)atomic_get(&diversity_err_both_failed),
+                (uint32_t)atomic_get(&diversity_err_cross_validated),
+                (uint32_t)atomic_get(&diversity_err_cross_mismatch));
     }
     k_work_schedule(&diversity_stats_work,
                     K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
@@ -2554,6 +2538,7 @@ static int ps2_uart_init(const struct device *dev) {
     }
 
     k_work_init(&data->callback_work, ps2_uart_read_callback_work_handler);
+    k_work_init(&data->resend_cmd_work, ps2_uart_send_cmd_resend_worker);
     k_msgq_init(&data->callback_msgq, data->callback_msgq_buffer,
                 sizeof(uint8_t), PS2_UART_CALLBACK_QUEUE_SIZE);
 
