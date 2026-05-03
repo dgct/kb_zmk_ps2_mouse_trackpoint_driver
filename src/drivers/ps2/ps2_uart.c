@@ -24,6 +24,8 @@
 #include <nrfx_ppi.h>
 #include <nrfx_gpiote.h>
 
+static const nrfx_gpiote_t nrfx_gpiote = NRFX_GPIOTE_INSTANCE(0);
+
 /*
  * Dual-UARTE Diversity Receiver with erasure-code repair
  *
