@@ -65,11 +65,13 @@ static const nrfx_gpiote_t nrfx_gpiote = NRFX_GPIOTE_INSTANCE(0);
  * avoid conflicts with MPSL, SoftDevice Controller, and other
  * nrfx drivers that share these fixed-count hardware resources. */
 
-/* Diversity receiver state */
+/* Diversity receiver state.
+ *
+ * UARTE1 runs ISR-free: SHORTS ENDRX_STARTRX re-arms DMA in hardware.
+ * UARTE0's ISR polls UARTE1's ENDRX event and reads uarte1_dma_buf +
+ * ERRORSRC directly — no volatile handoff variables needed.
+ */
 static volatile uint8_t  uarte1_dma_buf;
-static volatile uint8_t  uarte1_last_byte;
-static volatile uint32_t uarte1_last_err;
-static volatile bool     uarte1_byte_ready;
 static volatile bool     uarte1_initialized;
 static volatile bool     uart_suspended;
 
@@ -971,6 +973,45 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
 
     atomic_inc(&diversity_byte_count);
 
+    /* Poll UARTE1 diversity receiver (ISR-free: SHORTS re-arms DMA).
+     *
+     * UARTE1 fires ENDRX ~30µs before UARTE0, so by the time we
+     * reach here, uarte1_dma_buf and ERRORSRC are stable.  The next
+     * PS/2 byte won't overwrite uarte1_dma_buf for at least another
+     * ~37µs (67µs inter-byte gap minus 30µs timing offset).
+     *
+     * On framing error, UARTE does NOT store the byte to DMA and does
+     * NOT fire ENDRX.  ERRORSRC retains the error until we clear it.
+     * The receiver stays armed — no STARTRX needed, no ENDRX to clear.
+     * We detect this via EVENTS_ERROR without EVENTS_ENDRX.
+     */
+    bool u1_got_byte = false;
+    bool u1_got_error_only = false;
+    uint8_t u1_byte = 0;
+    uint32_t u1_errorsrc = 0;
+
+    if (uarte1_initialized) {
+        if (nrf_uarte_event_check(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX)) {
+            nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
+            u1_byte = uarte1_dma_buf;
+            u1_errorsrc = NRF_UARTE1->ERRORSRC;
+            NRF_UARTE1->ERRORSRC = u1_errorsrc;  /* W1C clear */
+            u1_got_byte = true;
+
+            /* Clear any ERROR event that accompanied this ENDRX.
+             * (e.g. parity mismatch — byte IS stored, ENDRX fires.) */
+            nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
+        } else if (nrf_uarte_event_check(NRF_UARTE1, NRF_UARTE_EVENT_ERROR)) {
+            /* ERROR without ENDRX: framing error — byte not stored.
+             * Clear ERROR + ERRORSRC so they don't leak into the next
+             * byte's check.  DMA stays armed (UARTE continues). */
+            nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
+            u1_errorsrc = NRF_UARTE1->ERRORSRC;
+            NRF_UARTE1->ERRORSRC = u1_errorsrc;  /* W1C clear */
+            u1_got_error_only = true;
+        }
+    }
+
     err = ps2_uart_read_err_check(config->uart_dev);
     if (err != 0) {
         const char *err_str = ps2_uart_read_get_error_str(err);
@@ -988,10 +1029,8 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
         if (err == UART_ERROR_FRAMING) {
             atomic_inc(&diversity_err_uarte0_framing);
 
-            if (uarte1_byte_ready) {
-                int u1_err = ps2_uart_diversity_check_err(uarte1_last_err);
-                uint8_t u1_byte = uarte1_last_byte;
-                uarte1_byte_ready = false;
+            if (u1_got_byte) {
+                int u1_err = ps2_uart_diversity_check_err(u1_errorsrc);
 
                 if (u1_err == 0) {
                     /* Normal fallback: UARTE1 decoded cleanly */
@@ -1019,6 +1058,13 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
                             ps2_uart_read_get_error_str(u1_err));
                     return;
                 }
+            } else if (u1_got_error_only) {
+                /* UARTE1 also had a framing error (no byte stored).
+                 * Both failed — outside coverage band. */
+                atomic_inc(&diversity_err_both_failed);
+                LOG_WRN("Diversity: both framing (u0=0x%02x, u1=error-only), "
+                        "discarding", byte);
+                return;
             } else {
                 /* UARTE1 not ready — can't repair.  Discard. */
                 atomic_inc(&diversity_err_both_failed);
@@ -1032,15 +1078,12 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
             atomic_inc(&diversity_err_uarte0_other);
             LOG_WRN("UART RX error for byte 0x%x: %s (%d)",
                     byte, err_str, err);
-            uarte1_byte_ready = false;
             return;
         }
-    } else if (uarte1_byte_ready) {
+    } else if (u1_got_byte) {
         /* UARTE0 clean — cross-validate against UARTE1.
          * In the overlap band (|ε| < 1/42), both should agree. */
-        int u1_err = ps2_uart_diversity_check_err(uarte1_last_err);
-        uint8_t u1_byte = uarte1_last_byte;
-        uarte1_byte_ready = false;
+        int u1_err = ps2_uart_diversity_check_err(u1_errorsrc);
 
         if (u1_err == 0) {
             if (u1_byte == byte) {
@@ -1058,9 +1101,6 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
         /* If UARTE1 had a framing error, that just means the TP
          * clock is in the UARTE0-only band — normal, no action. */
     }
-
-    // Consume UARTE1's byte even on success (stay in sync)
-    uarte1_byte_ready = false;
 
     // If write_byte_await_response() is waiting, check whether this
     // byte is a PS/2 protocol response (ACK/NAK/ERR).  Only those
@@ -2199,35 +2239,6 @@ static uint32_t ps2_uart_ticks_to_baud_reg(uint32_t ticks) {
 }
 
 /**
- * UARTE1 ISR — bare-metal interrupt handler for the diversity receiver.
- *
- * Fires ~30 µs BEFORE UARTE0's ISR due to the faster baud rate. Captures
- * the received byte and error state for the decision logic in
- * ps2_uart_read_process_received_byte().
- */
-ISR_DIRECT_DECLARE(uarte1_diversity_isr) {
-    if (nrf_uarte_event_check(NRF_UARTE1, NRF_UARTE_EVENT_ERROR)) {
-        nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
-        /* Errors are read from ERRORSRC in the ENDRX path below */
-    }
-
-    if (nrf_uarte_event_check(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX)) {
-        nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
-
-        uarte1_last_byte = uarte1_dma_buf;
-        uarte1_last_err = NRF_UARTE1->ERRORSRC;
-        NRF_UARTE1->ERRORSRC = uarte1_last_err;  /* W1C clear */
-        uarte1_byte_ready = true;
-
-        /* Re-arm DMA for next byte (PTR/MAXCNT survive) */
-        nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
-    }
-
-    ISR_DIRECT_PM();
-    return 1;  /* Do not invoke Zephyr scheduling */
-}
-
-/**
  * Initialize the diversity receiver: schedule deferred CLK calibration.
  *
  * At boot the TP hasn't started streaming yet, so there are no CLK edges
@@ -2272,6 +2283,10 @@ void ps2_uart_diversity_stop_rx(void) {
         return;
     }
 
+    /* Disable SHORTS before STOPRX to prevent the shortcut from
+     * re-arming DMA during the shutdown sequence. */
+    NRF_UARTE1->SHORTS = 0;
+
     nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STOPRX);
 
     // Wait for RXTO: UARTE's internal 4-byte timer needs ~3 ms at
@@ -2289,7 +2304,8 @@ void ps2_uart_diversity_stop_rx(void) {
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXTO);
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXSTARTED);
-    uarte1_byte_ready = false;
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
+    NRF_UARTE1->ERRORSRC = 0x0F;  /* Clear any stale error bits */
 
     /* Fully disable UARTE1 and release the RX pin.
      * PSEL can only be modified while the peripheral is disabled.
@@ -2321,8 +2337,12 @@ void ps2_uart_diversity_start_rx(void) {
 
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ENDRX);
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_ERROR);
+    nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXSTARTED);
     NRF_UARTE1->ERRORSRC = 0x0F;
-    uarte1_byte_ready = false;
+
+    /* Enable SHORTS before STARTRX so DMA re-arms in hardware */
+    NRF_UARTE1->SHORTS = UARTE_SHORTS_ENDRX_STARTRX_Msk;
+
     nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
 }
 
@@ -2407,8 +2427,8 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
 
     /* Apply calibrated slow baud to UARTE0 (primary, Zephyr-managed).
      * UARTE0 fires ENDRX ~30µs AFTER UARTE1, so by the time the
-     * decision logic runs in UARTE0's ISR, uarte1_byte_ready is
-     * already set — enabling correct cross-validation.
+     * decision logic polls UARTE1's ENDRX event, the DMA byte and
+     * ERRORSRC are stable — enabling correct cross-validation.
      *
      * Inhibit CLK while changing BAUDRATE to prevent corruption of
      * any in-flight byte. */
@@ -2419,8 +2439,9 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
             old_baud, diversity_baud_slow);
 
     /* Bring up UARTE1 diversity receiver with the fast baud.
-     * UARTE1 fires ENDRX first, storing its byte before UARTE0's
-     * callback runs. */
+     * ISR-free: SHORTS ENDRX_STARTRX re-arms DMA in hardware.
+     * UARTE0's ISR polls UARTE1's ENDRX event and reads the
+     * DMA byte + ERRORSRC directly. */
     nrf_uarte_enable(NRF_UARTE1);
     nrf_uarte_disable(NRF_UARTE1);
 
@@ -2444,18 +2465,16 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXTO);
     nrf_uarte_event_clear(NRF_UARTE1, NRF_UARTE_EVENT_RXSTARTED);
 
-    nrf_uarte_int_enable(NRF_UARTE1,
-                         NRF_UARTE_INT_ENDRX_MASK | NRF_UARTE_INT_ERROR_MASK);
-    IRQ_DIRECT_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_UARTE1), 1,
-                       uarte1_diversity_isr, 0);
-    irq_enable(NRFX_IRQ_NUMBER_GET(NRF_UARTE1));
+    /* Hardware re-arm: ENDRX → STARTRX shortcut, no ISR needed.
+     * DMA re-arms in the same cycle as ENDRX — immune to BLE
+     * preemption, zero CPU involvement per byte. */
+    NRF_UARTE1->SHORTS = UARTE_SHORTS_ENDRX_STARTRX_Msk;
 
-    uarte1_byte_ready = false;
     nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
     uarte1_initialized = true;
 
-    LOG_INF("Deferred cal: UARTE1 diversity receiver up at 0x%08x",
-            diversity_baud_fast);
+    LOG_INF("Deferred cal: UARTE1 diversity receiver up (ISR-free, SHORTS) "
+            "at 0x%08x", diversity_baud_fast);
 
     k_work_schedule(&diversity_stats_work,
                     K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
