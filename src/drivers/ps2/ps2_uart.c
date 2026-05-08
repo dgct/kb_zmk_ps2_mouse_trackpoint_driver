@@ -191,10 +191,13 @@ LOG_MODULE_REGISTER(ps2_uart);
 // is 100us, but we triple it just in case.
 #define PS2_UART_TIMING_SCL_INHIBITION_MIN 100
 
-// Theoretically, only 100us is required, but practically, trackponts
-// seem to respond to a total duration of 1,000 us the best.
-// This is also the duration my USB to PS/2 adapter is using.
-#define PS2_UART_TIMING_SCL_INHIBITION (5 * PS2_UART_TIMING_SCL_INHIBITION_MIN)
+// Theoretically, only 100us is required, but practically, trackpoints
+// need more than the bare minimum for reliable detection.  The SK8707's
+// 14.9 kHz internal clock (67µs/cycle) means 200µs guarantees 2–3
+// full sampling opportunities.  Previous value was 5× (500µs) based
+// on USB-to-PS/2 adapter behaviour; 2× is the safe minimum for the
+// SK8707 and saves ~600µs CPU spin per write byte.
+#define PS2_UART_TIMING_SCL_INHIBITION (2 * PS2_UART_TIMING_SCL_INHIBITION_MIN)
 
 // PS2 uses a frequency between 10 kHz and 16.7 kHz. So clocks should arrive
 // within 60-100us.
@@ -1370,7 +1373,7 @@ static int ps2_uart_timeslot_acquire(void)
             LOG_WRN("MPSL timeslot request error: %d", err);
             return -EBUSY;
         }
-        k_busy_wait(100);
+        k_yield();
     }
     if (err) {
         LOG_DBG("MPSL timeslot request gave up after 10ms");
@@ -1378,8 +1381,9 @@ static int ps2_uart_timeslot_acquire(void)
     }
 
     // Poll until signal handler sets one of the flags.
-    // Our thread is cooperative (prio 10) and k_busy_wait doesn't yield,
-    // so no rescheduling happens during the poll — only ISRs fire and return.
+    // k_yield() lets the CPU idle (WFI) between checks — the MPSL
+    // signal fires at ISR priority and sets the atomic, after which
+    // the scheduler returns us here on the next pass.
     for (int i = 0; i < PS2_UART_TIMESLOT_MAX_POLL_ITERS; i++) {
         if (atomic_get(&ts_started)) {
             return 0;
@@ -1388,7 +1392,7 @@ static int ps2_uart_timeslot_acquire(void)
             LOG_DBG("MPSL timeslot blocked");
             return -EBUSY;
         }
-        k_busy_wait(PS2_UART_TIMESLOT_POLL_INTERVAL_US);
+        k_yield();
     }
 
     LOG_DBG("MPSL timeslot poll timed out");
@@ -1483,7 +1487,7 @@ int ps2_uart_timeslot_batch_begin(void)
             LOG_WRN("MPSL batch timeslot request error: %d", err);
             return -EBUSY;
         }
-        k_busy_wait(100);
+        k_yield();
     }
     if (err) {
         LOG_DBG("MPSL batch timeslot request gave up after 10ms");
@@ -1500,7 +1504,7 @@ int ps2_uart_timeslot_batch_begin(void)
             LOG_WRN("MPSL batch timeslot blocked — writes will use per-byte protection");
             return -EBUSY;
         }
-        k_busy_wait(PS2_UART_TIMESLOT_POLL_INTERVAL_US);
+        k_yield();
     }
 
     LOG_WRN("MPSL batch timeslot poll timed out — writes will use per-byte protection");
