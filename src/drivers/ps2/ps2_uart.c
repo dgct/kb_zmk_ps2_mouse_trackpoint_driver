@@ -456,7 +456,7 @@ int ps2_uart_configure_pin_scl_input(const struct device *dev) {
 }
 
 int ps2_uart_configure_pin_scl_output(const struct device *dev) {
-    return ps2_uart_configure_pin_scl(dev, (GPIO_OUTPUT_HIGH), "output");
+    return ps2_uart_configure_pin_scl(dev, (GPIO_OUTPUT_HIGH | GPIO_OPEN_DRAIN), "output");
 }
 
 int ps2_uart_configure_pin_sda(const struct device *dev, gpio_flags_t flags, char *descr) {
@@ -476,7 +476,7 @@ int ps2_uart_configure_pin_sda_input(const struct device *dev) {
 }
 
 int ps2_uart_configure_pin_sda_output(const struct device *dev) {
-    return ps2_uart_configure_pin_sda(dev, (GPIO_OUTPUT_HIGH), "output");
+    return ps2_uart_configure_pin_sda(dev, (GPIO_OUTPUT_HIGH | GPIO_OPEN_DRAIN), "output");
 }
 
 int ps2_uart_set_scl_callback_enabled(const struct device *dev, bool enabled) {
@@ -523,7 +523,7 @@ int ps2_uart_set_scl_callback_enabled(const struct device *dev, bool enabled) {
  * glitch, no spurious edge.
  */
 void ps2_uart_inhibit_bus(const struct device *dev) {
-    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW, "output-low (inhibit)");
+    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW | GPIO_OPEN_DRAIN, "output-low (inhibit)");
     k_busy_wait(100);  /* PS/2 spec: host must hold CLK LOW ≥100µs */
 }
 
@@ -638,7 +638,7 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
      *
      * Use GPIO_OUTPUT_LOW to avoid a HIGH→LOW glitch that would
      * create a spurious CLK cycle (see inhibit_bus comment). */
-    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW, "output-low (inhibit)");
+    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW | GPIO_OPEN_DRAIN, "output-low (inhibit)");
     k_busy_wait(100);  /* PS/2 spec: host must hold CLK LOW ≥100µs */
 
     // Set the SDA pin for the uart device
@@ -698,7 +698,7 @@ static int ps2_uart_set_mode_write(const struct device *dev) {
      * Use GPIO_OUTPUT_LOW to avoid a HIGH→LOW glitch that would
      * create a spurious CLK cycle (see inhibit_bus comment). */
     ps2_uart_set_scl_callback_enabled(dev, false);
-    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW, "output-low (inhibit)");
+    ps2_uart_configure_pin_scl(dev, GPIO_OUTPUT_LOW | GPIO_OPEN_DRAIN, "output-low (inhibit)");
     k_busy_wait(100);  /* PS/2 spec: host must hold CLK LOW ≥100µs */
 
     // Cleanly stop UARTE RX DMA before disconnecting the pin.
