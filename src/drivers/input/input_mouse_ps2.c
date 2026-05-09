@@ -31,6 +31,12 @@ struct zmk_mouse_ps2_data;
 static void tp_idle_pm_notify_activity(struct zmk_mouse_ps2_data *data);
 #endif
 
+/* Forward declarations for functions used before their definitions */
+int zmk_mouse_ps2_activity_reporting_enable(const struct device *dev);
+int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev);
+int zmk_mouse_ps2_tp_get_config_byte(const struct device *dev, uint8_t *config_byte);
+int zmk_mouse_ps2_reset(const struct device *dev, const struct device *ps2_device);
+
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /*
