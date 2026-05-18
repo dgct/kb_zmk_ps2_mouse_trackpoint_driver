@@ -21,7 +21,7 @@
 #include <hal/nrf_ppi.h>
 #include <hal/nrf_timer.h>
 #include <nrfx.h>
-#include <nrfx_ppi.h>
+#include <helpers/nrfx_gppi.h>
 #include <nrfx_gpiote.h>
 
 static const nrfx_gpiote_t nrfx_gpiote = NRFX_GPIOTE_INSTANCE(0);
@@ -93,14 +93,30 @@ static uint32_t diversity_baud_slow;
 static uint32_t uarte0_rxd_ptr;
 static uint32_t uarte0_rxd_maxcnt;
 
-/* Deferred CLK calibration */
+/* Data-path triggered CLK calibration.
+ *
+ * CLK edges only exist while the TP is actively transmitting.  A blind
+ * timer cannot guarantee that.  Instead, the receive path triggers
+ * calibration when it sees the first burst of data — proving the TP
+ * is actively clocking and more packets are imminent (mouse movement
+ * produces bursts at 100-200 Hz).
+ *
+ * cal_pending: set at init, cleared on successful calibration.
+ * cal_rx_since_arm: bytes received since last arm.  When it crosses
+ *   the threshold (1 full 3-byte packet), calibration is scheduled
+ *   with a 1ms delay — short enough that the user's movement burst
+ *   is still flowing when the handler runs on cal_wq.
+ */
 static const struct device *cal_dev;   /* set once during init */
-static int deferred_cal_retries;       /* retries remaining */
+static atomic_t cal_pending;           /* true until calibration succeeds */
+static atomic_t cal_rx_since_arm;      /* bytes received since last arm */
+static int cal_retries_left;           /* retries remaining */
 static void ps2_uart_deferred_cal_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(deferred_cal_work, ps2_uart_deferred_cal_handler);
-#define PS2_UART_DEFERRED_CAL_DELAY_MS 5000
-#define PS2_UART_DEFERRED_CAL_RETRY_MS 3000
-#define PS2_UART_DEFERRED_CAL_MAX_RETRIES 3
+#define PS2_UART_CAL_RX_THRESHOLD     3     /* trigger after 1 full packet */
+#define PS2_UART_CAL_SCHEDULE_DELAY_MS 1   /* let ISR return, burst still flowing */
+#define PS2_UART_CAL_MAX_RETRIES      3
+#define PS2_UART_CAL_RETRY_BACKOFF_MS 3000 /* for UART-suspended retries only */
 
 /* Dedicated work queue for calibration — avoids blocking sysworkq
  * during the ~800ms busy-wait measurement loop. */
@@ -385,7 +401,7 @@ static mpsl_timeslot_request_t ts_request_earliest = {
     .request_type = MPSL_TIMESLOT_REQ_TYPE_EARLIEST,
     .params.earliest = {
         .hfclk = MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE,
-        .priority = MPSL_TIMESLOT_PRIORITY_NORMAL,
+        .priority = MPSL_TIMESLOT_PRIORITY_HIGH,
         .length_us = PS2_UART_TIMESLOT_LENGTH_US,
         .timeout_us = PS2_UART_TIMESLOT_TIMEOUT_US,
     },
@@ -976,6 +992,23 @@ void ps2_uart_read_process_received_byte(const struct device *dev, uint8_t byte)
 
     atomic_inc(&diversity_byte_count);
 
+    /* Trigger CLK calibration from the data path.
+     *
+     * We are inside the UARTE0 ISR, so we *know* the TP just clocked
+     * out a byte — CLK edges are happening right now.  After 3 bytes
+     * (one full mouse packet), we're in a burst and schedule the
+     * calibration handler with 1ms delay.  At 100-200 Hz reporting
+     * rate, the next packet arrives in 5-10ms, so the handler will
+     * see live CLK edges when it runs on cal_wq.
+     */
+    if (atomic_get(&cal_pending)) {
+        atomic_val_t n = atomic_inc(&cal_rx_since_arm) + 1;
+        if (n == PS2_UART_CAL_RX_THRESHOLD) {
+            k_work_schedule_for_queue(&cal_wq, &deferred_cal_work,
+                                      K_MSEC(PS2_UART_CAL_SCHEDULE_DELAY_MS));
+        }
+    }
+
     /* Poll UARTE1 diversity receiver (ISR-free: SHORTS re-arms DMA).
      *
      * UARTE1 fires ENDRX ~30µs before UARTE0, so by the time we
@@ -1448,6 +1481,10 @@ int ps2_uart_timeslot_batch_begin(void)
 {
     int err;
 
+    // Lazy init: session may not have been available at boot
+    if (!ts_session_open) {
+        ps2_uart_timeslot_init();
+    }
     if (!ts_session_open) {
         return -ENODEV;
     }
@@ -1644,29 +1681,44 @@ int ps2_uart_write_byte_blocking(const struct device *dev, uint8_t byte) {
     int ts_err = -EBUSY;
 
     if (!in_batch) {
-        // Per-byte timeslot acquire with exponential backoff.
-        // BLE connection events typically run 1.25–7.5ms, so
-        // fixed 1ms retries often land inside the same event.
-        // Exponential backoff (2, 4, 8, 16ms) spans progressively
-        // longer windows, giving MPSL more opportunities to fit
-        // our timeslot between radio events.
-        //
-        // HARD GATE: if all attempts fail, we return an error
-        // instead of writing unprotected. The outer write_byte()
-        // retry loop will try again.
-        for (int ts_attempt = 0; ts_attempt < 5; ts_attempt++) {
-            ts_err = ps2_uart_timeslot_acquire();
-            if (ts_err == 0) {
-                break;
-            }
-            if (ts_attempt < 4) {
-                k_msleep(2 << ts_attempt);  // 2, 4, 8, 16ms
-            }
+        // Three-tier PS/2 write protection:
+        //   Tier 1 (pre-MPSL): Session can't open — MPSL ISRs don't
+        //     exist yet (POST_KERNEL boot). Proceed unprotected; no
+        //     radio ISRs can preempt the bit-bang.
+        //   Tier 2 (timeslot): Session open, timeslot acquired —
+        //     radio suppressed for the duration of the write.
+        //   Tier 3 (unprotected + retry): Session open but timeslot
+        //     can't be acquired (radio too busy, e.g. subrate
+        //     factor=1). Proceed without protection; PS/2 protocol
+        //     retry (0xFE resend) handles any corruption.
+
+        // Lazy init: timeslot session may not have been available at
+        // POST_KERNEL 80 boot (MPSL not yet initialized by bt_enable).
+        if (!ts_session_open) {
+            ps2_uart_timeslot_init();
         }
-        if (ts_err != 0) {
-            LOG_WRN("Timeslot acquire failed after 5 attempts for "
-                    "byte 0x%x — refusing unprotected write", byte);
-            return PS2_UART_E_WRITE_TRANSMIT;
+
+        if (ts_session_open) {
+            // Tier 2 attempt: per-byte timeslot with exponential backoff.
+            for (int ts_attempt = 0; ts_attempt < 5; ts_attempt++) {
+                ts_err = ps2_uart_timeslot_acquire();
+                if (ts_err == 0) {
+                    break;
+                }
+                if (ts_attempt < 4) {
+                    k_msleep(2 << ts_attempt);  // 2, 4, 8, 16ms
+                }
+            }
+            if (ts_err != 0) {
+                // Tier 3: radio too busy — proceed unprotected.
+                // PS/2 protocol retry handles any corruption.
+                LOG_WRN("No timeslot for 0x%x after 5 attempts, "
+                        "proceeding unprotected (Tier 3)", byte);
+            }
+        } else {
+            // Tier 1: MPSL not initialized. No radio ISRs exist
+            // to preempt — write is inherently safe.
+            LOG_DBG("Pre-MPSL write of 0x%x (Tier 1)", byte);
         }
     }
 #endif
@@ -2134,22 +2186,23 @@ static uint32_t ps2_uart_calibrate_clk_period(const struct device *dev) {
     uint32_t deltas[PS2_UART_CAL_EDGES];
     uint32_t prev_ts = 0;
     int count = 0;
-    nrfx_err_t nerr;
+    int gpiote_err;
     nrf_ppi_channel_t cal_ppi_ch;
     uint8_t cal_gpiote_ch;
 
     /* Allocate PPI channel (respects MPSL/SDC reservations) */
-    nerr = nrfx_ppi_channel_alloc(&cal_ppi_ch);
-    if (nerr != NRFX_SUCCESS) {
-        LOG_WRN("CLK calibration: PPI channel alloc failed (0x%x)", nerr);
+    int gppi_ch = nrfx_gppi_channel_alloc(0);
+    if (gppi_ch < 0) {
+        LOG_WRN("CLK calibration: PPI channel alloc failed (%d)", gppi_ch);
         return 0;
     }
+    cal_ppi_ch = (nrf_ppi_channel_t)gppi_ch;
 
     /* Allocate GPIOTE channel */
-    nerr = nrfx_gpiote_channel_alloc(&nrfx_gpiote, &cal_gpiote_ch);
-    if (nerr != NRFX_SUCCESS) {
-        LOG_WRN("CLK calibration: GPIOTE channel alloc failed (0x%x)", nerr);
-        nrfx_ppi_channel_free(cal_ppi_ch);
+    gpiote_err = nrfx_gpiote_channel_alloc(&nrfx_gpiote, &cal_gpiote_ch);
+    if (gpiote_err < 0) {
+        LOG_WRN("CLK calibration: GPIOTE channel alloc failed (%d)", gpiote_err);
+        nrfx_gppi_channel_free(0, cal_ppi_ch);
         return 0;
     }
 
@@ -2212,7 +2265,7 @@ teardown:
     nrf_gpiote_te_default(NRF_GPIOTE, cal_gpiote_ch);
     nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_STOP);
     nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_CLEAR);
-    nrfx_ppi_channel_free(cal_ppi_ch);
+    nrfx_gppi_channel_free(0, cal_ppi_ch);
     nrfx_gpiote_channel_free(&nrfx_gpiote, cal_gpiote_ch);
 
     if (count < 4) {
@@ -2243,21 +2296,23 @@ static uint32_t ps2_uart_ticks_to_baud_reg(uint32_t ticks) {
 }
 
 /**
- * Initialize the diversity receiver: schedule deferred CLK calibration.
+ * Initialize the diversity receiver: arm data-path triggered CLK calibration.
  *
  * At boot the TP hasn't started streaming yet, so there are no CLK edges
  * to measure.  We start with the hardcoded CONFIG_PS2_UART_CUSTOM_BAUDRATE_REG
- * (the empirically-proven "magic number") and schedule a calibration attempt
- * for T+2s, by which time the TP is streaming movement data and CLK edges
- * are plentiful.
+ * and arm a trigger in the receive path: after the first 3-byte packet
+ * arrives (proving TP is active), calibration runs on cal_wq while the
+ * user's movement burst is still flowing.
  *
- * If the deferred calibration succeeds, it computes the center baud from
- * measured CLK period, derives the fast/slow δ-spread registers, configures
- * UARTE1, and updates UARTE0's BAUDRATE.
+ * If calibration succeeds, it computes the center baud from measured CLK
+ * period, derives the fast/slow delta-spread registers, configures UARTE1,
+ * and updates UARTE0's BAUDRATE.
  */
 static int ps2_uart_diversity_init(const struct device *dev) {
     cal_dev = dev;
-    deferred_cal_retries = PS2_UART_DEFERRED_CAL_MAX_RETRIES;
+    cal_retries_left = PS2_UART_CAL_MAX_RETRIES;
+    atomic_set(&cal_pending, 1);
+    atomic_set(&cal_rx_since_arm, 0);
 
     if (!cal_wq_started) {
         k_work_queue_init(&cal_wq);
@@ -2268,10 +2323,7 @@ static int ps2_uart_diversity_init(const struct device *dev) {
         cal_wq_started = true;
     }
 
-    LOG_INF("Diversity: using hardcoded baud, deferred calibration in %d ms",
-            PS2_UART_DEFERRED_CAL_DELAY_MS);
-    k_work_schedule_for_queue(&cal_wq, &deferred_cal_work,
-                              K_MSEC(PS2_UART_DEFERRED_CAL_DELAY_MS));
+    LOG_INF("Diversity: using hardcoded baud, cal armed (trigger on first data)");
     return 0;
 }
 
@@ -2373,26 +2425,24 @@ static int ps2_uart_diversity_check_err(uint32_t errorsrc) {
 }
 
 /**
- * Deferred CLK calibration work handler.
+ * CLK calibration work handler (data-path triggered).
  *
- * Runs ~2s after boot when the TP is streaming and CLK edges are available.
- * Measures CLK period, computes optimal BAUDRATE, and optionally brings up
- * the UARTE1 diversity receiver.
+ * Scheduled from the UARTE0 receive ISR when the first burst of TP data
+ * proves the CLK line is actively toggling.  Runs on cal_wq (not sysworkq)
+ * because the measurement busy-waits ~800ms.
  */
 static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
-    if (cal_dev == NULL) {
+    if (cal_dev == NULL || !atomic_get(&cal_pending)) {
         return;
     }
 
-    /* Don't burn retries while the UART is suspended (TP dormant) —
-     * no CLK edges are possible.  Re-schedule for after wake. */
+    /* If UART got suspended between the trigger and now, re-arm.
+     * The next wake → data burst will re-trigger us. */
     if (uart_suspended) {
-        LOG_INF("Deferred calibration: UART suspended, deferring %d ms",
-                PS2_UART_DEFERRED_CAL_RETRY_MS);
-        k_work_schedule_for_queue(&cal_wq, &deferred_cal_work,
-                                  K_MSEC(PS2_UART_DEFERRED_CAL_RETRY_MS));
+        LOG_INF("CLK cal: UART suspended, re-arming for next data burst");
+        atomic_set(&cal_rx_since_arm, 0);
         return;
     }
 
@@ -2400,16 +2450,18 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
 
     uint32_t clk_ticks = ps2_uart_calibrate_clk_period(cal_dev);
     if (clk_ticks == 0) {
-        if (deferred_cal_retries > 0) {
-            deferred_cal_retries--;
-            LOG_WRN("Deferred calibration: no CLK edges, retrying in %d ms "
-                    "(%d retries left)",
-                    PS2_UART_DEFERRED_CAL_RETRY_MS, deferred_cal_retries);
-            k_work_schedule_for_queue(&cal_wq, &deferred_cal_work,
-                                      K_MSEC(PS2_UART_DEFERRED_CAL_RETRY_MS));
+        if (cal_retries_left > 0) {
+            cal_retries_left--;
+            LOG_WRN("CLK cal: no edges (%d retries left), "
+                    "re-arming for next data burst",
+                    cal_retries_left);
+            /* Re-arm: the next burst of received bytes will
+             * re-trigger us via the data path. */
+            atomic_set(&cal_rx_since_arm, 0);
         } else {
-            LOG_WRN("Deferred calibration: no CLK edges after all retries, "
+            LOG_WRN("CLK cal: no edges after all retries, "
                     "keeping baud 0x%08x", old_baud);
+            atomic_set(&cal_pending, 0);
         }
         return;
     }
@@ -2424,7 +2476,7 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
                            + PS2_UART_DIVERSITY_DENOM / 2)
                           / PS2_UART_DIVERSITY_DENOM;
 
-    LOG_INF("Deferred cal: center=0x%08x, fast=0x%08x, slow=0x%08x "
+    LOG_INF("CLK cal: center=0x%08x, fast=0x%08x, slow=0x%08x "
             "(was 0x%08x)",
             diversity_baud_center, diversity_baud_fast,
             diversity_baud_slow, old_baud);
@@ -2439,7 +2491,7 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     ps2_uart_inhibit_bus(cal_dev);
     NRF_UARTE0->BAUDRATE = diversity_baud_slow;
     ps2_uart_release_bus(cal_dev);
-    LOG_INF("Deferred cal: UARTE0 BAUDRATE 0x%08x → 0x%08x",
+    LOG_INF("CLK cal: UARTE0 BAUDRATE 0x%08x → 0x%08x",
             old_baud, diversity_baud_slow);
 
     /* Bring up UARTE1 diversity receiver with the fast baud.
@@ -2477,8 +2529,11 @@ static void ps2_uart_deferred_cal_handler(struct k_work *work) {
     nrf_uarte_task_trigger(NRF_UARTE1, NRF_UARTE_TASK_STARTRX);
     uarte1_initialized = true;
 
-    LOG_INF("Deferred cal: UARTE1 diversity receiver up (ISR-free, SHORTS) "
+    LOG_INF("CLK cal: UARTE1 diversity receiver up (ISR-free, SHORTS) "
             "at 0x%08x", diversity_baud_fast);
+
+    /* Calibration complete — stop triggering from the data path. */
+    atomic_set(&cal_pending, 0);
 
     k_work_schedule(&diversity_stats_work,
                     K_MSEC(PS2_UART_DIVERSITY_STATS_INTERVAL_MS));
